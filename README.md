@@ -52,3 +52,9 @@ cargo check --workspace
 Workspace lint policy is inherited from the root `[workspace.lints]` tables.
 Member crates opt in with `[lints] workspace = true`; keep new shared lints
 low-noise and stage broad hygiene migrations separately.
+
+Fast test suite:
+
+```bash
+cargo test --workspace --all-targets
+```
