@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -15,6 +16,7 @@ const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
 const DEFAULT_STREAMING_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
+static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Complete benchmark settings for one configured run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -215,13 +217,10 @@ impl Workload {
         let target_path = target_path.as_ref();
         let file_sizes = workload_file_sizes(total_bytes, file_layout)?;
         let run_dir = create_unique_run_dir(target_path)?;
-        let mut files = Vec::with_capacity(file_sizes.len());
-
-        for (index, bytes) in file_sizes.into_iter().enumerate() {
-            let path = run_dir.join(format!("studiofs-bench-workload-{index:03}.bin"));
-            write_workload_file(&path, bytes)?;
-            files.push(WorkloadFile { path, bytes });
-        }
+        let buffer = benchmark_buffer(total_bytes);
+        let files = write_workload_files(&run_dir, file_sizes, |path, bytes| {
+            write_workload_file(path, bytes, &buffer)
+        })?;
 
         Ok(Self { run_dir, files })
     }
@@ -288,15 +287,15 @@ fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
     }
 
     let mut sizes = Vec::with_capacity(FILE_COUNT);
-    let mut allocated = 0_u128;
+    let mut allocated = 0_u64;
     for index in 0..FILE_COUNT {
         let weight = 95 + index as u64 % 11;
         let size = (u128::from(total_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
-        allocated += u128::from(size);
+        allocated += size;
         sizes.push(size);
     }
 
-    let mut remainder = total_bytes - allocated as u64;
+    let mut remainder = total_bytes - allocated;
     for size in &mut sizes {
         if remainder == 0 {
             break;
@@ -320,7 +319,8 @@ fn fixed_file_sizes(total_bytes: u64, file_size_mb: u64) -> Result<Vec<u64>, Wor
         return Err(ConfigError::FileLayoutExceedsWorkload.into());
     }
 
-    let mut sizes = Vec::new();
+    let capacity = usize::try_from(total_bytes.div_ceil(file_bytes)).unwrap_or(0);
+    let mut sizes = Vec::with_capacity(capacity);
     let mut remaining = total_bytes;
     while remaining > 0 {
         let size = remaining.min(file_bytes);
@@ -341,18 +341,44 @@ fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = target_path.join(format!("studiofs-bench-run-{}-{nanos}", std::process::id()));
+    let counter = RUN_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = target_path.join(format!(
+        "studiofs-bench-run-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
     std::fs::create_dir(&path)?;
     Ok(path)
 }
 
-fn write_workload_file(path: &Path, total_bytes: u64) -> Result<(), WorkloadError> {
+fn write_workload_files(
+    run_dir: &Path,
+    file_sizes: Vec<u64>,
+    mut write_file: impl FnMut(&Path, u64) -> Result<(), WorkloadError>,
+) -> Result<Vec<WorkloadFile>, WorkloadError> {
+    let mut files = Vec::with_capacity(file_sizes.len());
+
+    for (index, bytes) in file_sizes.into_iter().enumerate() {
+        let path = run_dir.join(format!("studiofs-bench-workload-{index:03}.bin"));
+        if let Err(error) = write_file(&path, bytes) {
+            let _ = std::fs::remove_dir_all(run_dir);
+            return Err(error);
+        }
+        files.push(WorkloadFile { path, bytes });
+    }
+
+    Ok(files)
+}
+
+fn benchmark_buffer(total_bytes: u64) -> Vec<u8> {
     let buffer_size = usize::try_from(total_bytes)
         .unwrap_or(DEFAULT_STREAMING_BLOCK_BYTES)
         .min(DEFAULT_STREAMING_BLOCK_BYTES);
     let mut buffer = vec![0_u8; buffer_size];
     fill_benchmark_buffer(&mut buffer);
+    buffer
+}
 
+fn write_workload_file(path: &Path, total_bytes: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
     let mut file = File::create(path)?;
     let mut written = 0_u64;
     while written < total_bytes {
@@ -898,6 +924,42 @@ mod tests {
         let sizes = hundred_file_sizes(u64::MAX).unwrap();
 
         assert_eq!(sizes.iter().sum::<u64>(), u64::MAX);
+    }
+
+    #[test]
+    fn write_workload_files_removes_run_dir_when_file_write_fails() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let error = write_workload_files(&run_dir, vec![1, 2], |path, bytes| {
+            if bytes == 2 {
+                return Err(std::io::Error::other("write failed").into());
+            }
+            File::create(path)?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "write failed");
+        assert!(!run_dir.exists());
+    }
+
+    #[test]
+    fn write_workload_file_uses_supplied_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-buffer-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        write_workload_file(&path, 5, &[1, 2, 3]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
