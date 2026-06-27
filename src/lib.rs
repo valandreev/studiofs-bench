@@ -1,5 +1,8 @@
 //! Benchmark configuration contract shared by CLI, TUI, runner, and reports.
 
+#![deny(missing_docs)]
+
+use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -27,11 +30,12 @@ pub struct BenchmarkConfig {
     pub save_report: bool,
     /// Whether the runner executes once or continuously.
     pub execution_mode: ExecutionMode,
-    /// User-facing throughput unit.
-    pub throughput_unit: &'static str,
 }
 
 impl BenchmarkConfig {
+    /// User-facing throughput unit.
+    pub const THROUGHPUT_UNIT: &'static str = "MB/s";
+
     /// Creates a config with documented defaults for the required target path.
     pub fn for_target(target_path: PathBuf) -> Self {
         Self {
@@ -43,7 +47,6 @@ impl BenchmarkConfig {
             keep_files: false,
             save_report: true,
             execution_mode: ExecutionMode::RunOnce,
-            throughput_unit: "MB/s",
         }
     }
 
@@ -94,12 +97,12 @@ impl WorkloadSize {
 
     /// Size in decimal megabytes.
     pub fn megabytes(self) -> u64 {
-        self.gigabytes() * MB_PER_GB
+        self.gigabytes().saturating_mul(MB_PER_GB)
     }
 
     /// Size in decimal bytes.
     pub fn bytes(self) -> u64 {
-        self.megabytes() * DECIMAL_MB
+        self.megabytes().saturating_mul(DECIMAL_MB)
     }
 }
 
@@ -146,6 +149,8 @@ pub enum FileLayout {
     /// Store the workload in one file.
     SingleFile,
     /// Split the workload into files of this decimal MB size.
+    ///
+    /// The final file may be smaller when the workload is not evenly divisible.
     FixedFileSizeMb(u64),
 }
 
@@ -194,3 +199,5 @@ impl fmt::Display for ConfigError {
         }
     }
 }
+
+impl Error for ConfigError {}

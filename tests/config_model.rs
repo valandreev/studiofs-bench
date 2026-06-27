@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use studiofs_bench::{
-    BenchmarkConfig, CacheMode, ExecutionMode, FileLayout, RunMode, WorkloadPreset, WorkloadSize,
+    BenchmarkConfig, CacheMode, ConfigError, ExecutionMode, FileLayout, RunMode, WorkloadPreset,
+    WorkloadSize,
 };
 
 #[test]
@@ -18,6 +19,39 @@ fn default_config_uses_documented_benchmark_contract() {
     assert!(!config.keep_files);
     assert!(config.save_report);
     assert_eq!(config.execution_mode, ExecutionMode::RunOnce);
+    assert_eq!(BenchmarkConfig::THROUGHPUT_UNIT, "MB/s");
+    assert_eq!(config.validate(), Ok(()));
+}
+
+#[test]
+fn workload_size_saturates_decimal_unit_conversions() {
+    let workload_size = WorkloadSize::CustomGb(u64::MAX);
+
+    assert_eq!(workload_size.megabytes(), u64::MAX);
+    assert_eq!(workload_size.bytes(), u64::MAX);
+}
+
+#[test]
+fn validate_rejects_empty_target_path() {
+    let config = BenchmarkConfig::for_target(PathBuf::new());
+
+    assert_eq!(config.validate(), Err(ConfigError::EmptyTargetPath));
+}
+
+#[test]
+fn validate_rejects_zero_workload() {
+    let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
+    config.workload_size = WorkloadSize::CustomGb(0);
+
+    assert_eq!(config.validate(), Err(ConfigError::ZeroWorkload));
+}
+
+#[test]
+fn validate_rejects_zero_file_size() {
+    let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
+    config.file_layout = FileLayout::FixedFileSizeMb(0);
+
+    assert_eq!(config.validate(), Err(ConfigError::ZeroFileSize));
 }
 
 #[test]
@@ -47,8 +81,8 @@ fn config_serializes_report_ready_values() {
     let value = serde_json::to_value(&config).unwrap();
 
     assert_eq!(value["workload_size"]["custom_gb"], 16);
-    assert_eq!(value["throughput_unit"], "MB/s");
     assert_eq!(value["run_mode"], "mounted_filesystem");
+    assert_eq!(value["file_layout"], "single_file");
     assert_eq!(value["cache_mode"], "cold");
     assert_eq!(value["keep_files"], true);
     assert_eq!(value["save_report"], false);
