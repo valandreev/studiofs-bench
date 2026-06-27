@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
 };
 
 const DECIMAL_MB: u64 = 1_000_000;
@@ -56,6 +56,8 @@ pub struct TerminalUi {
     running: bool,
     exit: bool,
     message: String,
+    progress: Option<LivePassProgress>,
+    pass_summaries: Vec<BenchmarkPassReport>,
 }
 
 impl Default for TerminalUi {
@@ -66,6 +68,8 @@ impl Default for TerminalUi {
             running: false,
             exit: false,
             message: String::from("Idle - Enter starts, Esc exits"),
+            progress: None,
+            pass_summaries: Vec::new(),
         }
     }
 }
@@ -117,6 +121,8 @@ impl TerminalUi {
             UiAction::Submit => {
                 self.running = !self.running;
                 self.message = if self.running {
+                    self.progress = None;
+                    self.pass_summaries.clear();
                     String::from("Running - Enter/Esc stops")
                 } else {
                     String::from("Stopping")
@@ -139,6 +145,55 @@ impl TerminalUi {
         self.message = message.into();
     }
 
+    /// Records one live progress sample for the active pass.
+    pub fn observe_sample(&mut self, sample: StreamingIoSample) {
+        let total_bytes = self
+            .config
+            .workload_size
+            .bytes()
+            .unwrap_or(sample.bytes_processed)
+            .max(sample.bytes_processed);
+        let is_new_pass = self.progress.as_ref().is_none_or(|progress| {
+            progress.phase != sample.phase || progress.pass_number != sample.pass_number
+        });
+        if is_new_pass {
+            if let Some(progress) = self.progress.take() {
+                self.pass_summaries.push(BenchmarkPassReport {
+                    phase: progress.phase,
+                    pass_number: progress.pass_number,
+                    bytes_processed: progress.bytes_processed,
+                    stopped: false,
+                    metrics: progress.metrics.finish(),
+                });
+            }
+            self.progress = Some(LivePassProgress {
+                phase: sample.phase,
+                pass_number: sample.pass_number,
+                bytes_processed: 0,
+                total_bytes,
+                current_mb_per_second: 0.0,
+                metrics: MetricsAccumulator::default(),
+            });
+        }
+
+        if let Some(progress) = &mut self.progress {
+            progress.total_bytes = progress.total_bytes.max(total_bytes);
+            progress.bytes_processed = sample.bytes_processed;
+            progress.current_mb_per_second = sample.mb_per_second;
+            progress.metrics.add(sample.mb_per_second);
+        }
+    }
+
+    /// Marks the run as finished and displays completed pass summaries.
+    pub fn finish_run_with_passes(
+        &mut self,
+        message: impl Into<String>,
+        passes: Vec<BenchmarkPassReport>,
+    ) {
+        self.finish_run(message);
+        self.pass_summaries = passes;
+    }
+
     /// Renders the full-screen terminal UI.
     pub fn render(&self, frame: &mut Frame<'_>) {
         let [header, settings, footer] = Layout::vertical([
@@ -152,6 +207,10 @@ impl TerminalUi {
             .block(Block::new().borders(Borders::BOTTOM))
             .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         frame.render_widget(title, header);
+
+        let [settings, metrics] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(settings);
 
         let rows = self
             .setting_rows()
@@ -175,6 +234,75 @@ impl TerminalUi {
         frame.render_widget(
             Paragraph::new(self.message.as_str()).block(Block::new().borders(Borders::TOP)),
             footer,
+        );
+        self.render_metrics(frame, metrics);
+    }
+
+    fn render_metrics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let [live, summary] =
+            Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).areas(area);
+
+        if let Some(progress) = &self.progress {
+            let ratio = if progress.total_bytes == 0 {
+                0.0
+            } else {
+                progress.bytes_processed as f64 / progress.total_bytes as f64
+            }
+            .clamp(0.0, 1.0);
+            let block = Block::new().title("Progress").borders(Borders::ALL);
+            let inner = block.inner(live);
+            frame.render_widget(block, live);
+            let [gauge_area, text_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(inner);
+            frame.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::new().fg(Color::Green))
+                    .ratio(ratio),
+                gauge_area,
+            );
+            let metrics = progress.metrics.finish();
+            let text = vec![
+                Line::from(format!(
+                    "Current {}: {:.1} MB/s",
+                    phase_label(progress.phase),
+                    progress.current_mb_per_second
+                )),
+                Line::from(format!(
+                    "Pass {} - {:.1} / {:.1} MB",
+                    progress.pass_number,
+                    progress.bytes_processed as f64 / DECIMAL_MB as f64,
+                    progress.total_bytes as f64 / DECIMAL_MB as f64
+                )),
+                Line::from(format!("Avg {:.1}", metrics.average_mb_per_second)),
+                Line::from(format!("Stable {:.1}", metrics.stable_mb_per_second)),
+            ];
+            frame.render_widget(Paragraph::new(text), text_area);
+        } else {
+            frame.render_widget(
+                Paragraph::new("No samples yet")
+                    .block(Block::new().title("Progress").borders(Borders::ALL)),
+                live,
+            );
+        }
+
+        let rows = self.pass_summaries.iter().flat_map(|pass| {
+            let metrics = pass.metrics;
+            [
+                ListItem::new(Line::from(format!(
+                    "{} pass {}: Avg {:.1}",
+                    phase_label(pass.phase),
+                    pass.pass_number,
+                    metrics.average_mb_per_second
+                ))),
+                ListItem::new(Line::from(format!(
+                    "Stable {:.1}  Min {:.1}  Drops {}",
+                    metrics.stable_mb_per_second, metrics.minimum_mb_per_second, metrics.drop_count
+                ))),
+            ]
+        });
+        frame.render_widget(
+            List::new(rows).block(Block::new().title("Pass summaries").borders(Borders::ALL)),
+            summary,
         );
     }
 
@@ -245,6 +373,16 @@ const EXECUTION_MODE_SETTING: usize = 5;
 const KEEP_FILES_SETTING: usize = 6;
 const SAVE_REPORT_SETTING: usize = 7;
 const SETTING_COUNT: usize = 8;
+
+#[derive(Debug)]
+struct LivePassProgress {
+    phase: StreamingIoPhase,
+    pass_number: u64,
+    bytes_processed: u64,
+    total_bytes: u64,
+    current_mb_per_second: f64,
+    metrics: MetricsAccumulator,
+}
 
 /// Complete benchmark settings for one configured run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -980,6 +1118,7 @@ impl BenchmarkRunner {
     ) -> Result<BenchmarkPassReport, BenchmarkRunnerError> {
         let mut bytes_processed = 0;
         let mut stopped = false;
+        let mut metrics = MetricsAccumulator::default();
         let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
         let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
         if phase == StreamingIoPhase::Write {
@@ -992,29 +1131,37 @@ impl BenchmarkRunner {
                 break;
             }
 
-            let report = match phase {
-                StreamingIoPhase::Write => self.engine.write_with_buffer(
-                    StreamingIoPass {
-                        path: &file.path,
-                        total_bytes: file.bytes,
-                        cache_mode: config.cache_mode,
-                        pass_number,
-                    },
-                    &mut buffer,
-                    &mut *on_sample,
-                    &mut *should_stop,
-                )?,
-                StreamingIoPhase::Read => self.engine.read_with_buffer(
-                    StreamingIoPass {
-                        path: &file.path,
-                        total_bytes: file.bytes,
-                        cache_mode: config.cache_mode,
-                        pass_number,
-                    },
-                    &mut buffer,
-                    &mut *on_sample,
-                    &mut *should_stop,
-                )?,
+            let report = {
+                let mut observe_sample = |mut sample: StreamingIoSample| {
+                    sample.offset += bytes_processed;
+                    sample.bytes_processed += bytes_processed;
+                    metrics.add(sample.mb_per_second);
+                    on_sample(sample);
+                };
+                match phase {
+                    StreamingIoPhase::Write => self.engine.write_with_buffer(
+                        StreamingIoPass {
+                            path: &file.path,
+                            total_bytes: file.bytes,
+                            cache_mode: config.cache_mode,
+                            pass_number,
+                        },
+                        &mut buffer,
+                        &mut observe_sample,
+                        &mut *should_stop,
+                    )?,
+                    StreamingIoPhase::Read => self.engine.read_with_buffer(
+                        StreamingIoPass {
+                            path: &file.path,
+                            total_bytes: file.bytes,
+                            cache_mode: config.cache_mode,
+                            pass_number,
+                        },
+                        &mut buffer,
+                        &mut observe_sample,
+                        &mut *should_stop,
+                    )?,
+                }
             };
             bytes_processed += match phase {
                 StreamingIoPhase::Write => report.bytes_written,
@@ -1031,7 +1178,54 @@ impl BenchmarkRunner {
             pass_number,
             bytes_processed,
             stopped,
+            metrics: metrics.finish(),
         })
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsAccumulator {
+    sample_count: u64,
+    sum: f64,
+    stable_sum: f64,
+    stable_count: u64,
+    minimum: Option<f64>,
+    previous: Option<f64>,
+    drop_count: u64,
+}
+
+impl MetricsAccumulator {
+    fn add(&mut self, value: f64) {
+        self.sample_count += 1;
+        self.sum += value;
+        self.minimum = Some(self.minimum.map_or(value, |minimum| minimum.min(value)));
+
+        if self.previous.is_some_and(|previous| value < previous) {
+            self.drop_count += 1;
+        } else {
+            self.stable_sum += value;
+            self.stable_count += 1;
+        }
+        self.previous = Some(value);
+    }
+
+    fn finish(&self) -> BenchmarkPassMetrics {
+        let average = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 };
+
+        BenchmarkPassMetrics {
+            sample_count: self.sample_count,
+            average_mb_per_second: average(self.sum, self.sample_count),
+            stable_mb_per_second: average(self.stable_sum, self.stable_count),
+            minimum_mb_per_second: self.minimum.unwrap_or(0.0),
+            drop_count: self.drop_count,
+        }
+    }
+}
+
+fn phase_label(phase: StreamingIoPhase) -> &'static str {
+    match phase {
+        StreamingIoPhase::Write => "write",
+        StreamingIoPhase::Read => "read",
     }
 }
 
@@ -1061,6 +1255,23 @@ pub struct BenchmarkPassReport {
     pub bytes_processed: u64,
     /// Whether the phase stopped before all files completed.
     pub stopped: bool,
+    /// Metrics calculated from samples emitted during this pass.
+    pub metrics: BenchmarkPassMetrics,
+}
+
+/// Throughput metrics calculated from samples for one benchmark pass.
+#[derive(Debug, Default, Copy, Clone, Serialize)]
+pub struct BenchmarkPassMetrics {
+    /// Number of samples included in the metrics.
+    pub sample_count: u64,
+    /// Mean sample throughput in decimal MB/s.
+    pub average_mb_per_second: f64,
+    /// Mean throughput excluding samples lower than the previous sample.
+    pub stable_mb_per_second: f64,
+    /// Lowest sample throughput in decimal MB/s.
+    pub minimum_mb_per_second: f64,
+    /// Count of samples lower than the previous sample.
+    pub drop_count: u64,
 }
 
 /// Benchmark runner error.
@@ -1672,6 +1883,31 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminal_ui_updates_unknown_total_bytes_from_later_samples() {
+        let mut ui = TerminalUi::default();
+        ui.config.workload_size = WorkloadSize::CustomGb(u64::MAX);
+
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 0,
+            mb_per_second: 0.0,
+        });
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 10 * DECIMAL_MB,
+            mb_per_second: 100.0,
+        });
+
+        assert_eq!(ui.progress.unwrap().total_bytes, 10 * DECIMAL_MB);
     }
 
     #[test]

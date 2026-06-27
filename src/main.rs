@@ -13,7 +13,8 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, TerminalUi, UiAction,
+    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, StreamingIoSample, TerminalUi,
+    UiAction,
 };
 
 fn main() -> io::Result<()> {
@@ -34,6 +35,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     let mut should_render = true;
 
     while !ui.should_exit() {
+        if let Some(run) = &running {
+            for sample in run.samples.try_iter() {
+                ui.observe_sample(sample);
+                should_render = true;
+            }
+        }
+
         if finish_completed_run(&mut running, &mut ui) {
             should_render = true;
         }
@@ -95,22 +103,34 @@ fn key_action(code: KeyCode) -> Option<UiAction> {
 
 struct RunningBenchmark {
     stop: Arc<AtomicBool>,
+    samples: Receiver<StreamingIoSample>,
     done: Receiver<Result<BenchmarkRunnerReport, String>>,
 }
 
 fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
     let stop = Arc::new(AtomicBool::new(false));
     let should_stop = Arc::clone(&stop);
+    let (sample_tx, samples) = mpsc::channel();
     let (done_tx, done) = mpsc::channel();
 
     thread::spawn(move || {
         let result = BenchmarkRunner::default()
-            .run(&config, |_| {}, || should_stop.load(Ordering::Relaxed))
+            .run(
+                &config,
+                |sample| {
+                    let _ = sample_tx.send(sample);
+                },
+                || should_stop.load(Ordering::Relaxed),
+            )
             .map_err(|error| error.to_string());
         let _ = done_tx.send(result);
     });
 
-    RunningBenchmark { stop, done }
+    RunningBenchmark {
+        stop,
+        samples,
+        done,
+    }
 }
 
 fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut TerminalUi) -> bool {
@@ -120,11 +140,20 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
 
     match run.done.try_recv() {
         Ok(result) => {
-            ui.finish_run(match result {
-                Ok(report) if report.stopped => String::from("Stopped"),
-                Ok(report) => format!("Done - {} passes", report.passes.len()),
-                Err(error) => format!("Error - {error}"),
-            });
+            for sample in run.samples.try_iter() {
+                ui.observe_sample(sample);
+            }
+            match result {
+                Ok(report) => {
+                    let message = if report.stopped {
+                        String::from("Stopped")
+                    } else {
+                        format!("Done - {} passes", report.passes.len())
+                    };
+                    ui.finish_run_with_passes(message, report.passes);
+                }
+                Err(error) => ui.finish_run(format!("Error - {error}")),
+            }
             *running = None;
             true
         }
@@ -150,6 +179,7 @@ fn stop_running(running: Option<RunningBenchmark>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_bench::StreamingIoPhase;
 
     fn stopped_report() -> BenchmarkRunnerReport {
         BenchmarkRunnerReport {
@@ -170,6 +200,7 @@ mod tests {
 
         let completed = stop_running(Some(RunningBenchmark {
             stop: Arc::clone(&stop),
+            samples: mpsc::channel().1,
             done,
         }));
 
@@ -184,7 +215,11 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done) = mpsc::channel();
         drop(done_tx);
-        let mut running = Some(RunningBenchmark { stop, done });
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples: mpsc::channel().1,
+            done,
+        });
 
         let changed = finish_completed_run(&mut running, &mut ui);
 
@@ -199,7 +234,11 @@ mod tests {
         ui.handle_action(UiAction::Submit);
         let stop = Arc::new(AtomicBool::new(false));
         let (_done_tx, done) = mpsc::channel();
-        let mut running = Some(RunningBenchmark { stop, done });
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples: mpsc::channel().1,
+            done,
+        });
 
         let changed = finish_completed_run(&mut running, &mut ui);
 
@@ -209,12 +248,81 @@ mod tests {
     }
 
     #[test]
+    fn finish_completed_run_drains_final_samples_before_clearing_run() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        sample_tx
+            .send(StreamingIoSample {
+                phase: StreamingIoPhase::Write,
+                pass_number: 1,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                offset: 0,
+                bytes_processed: 500_000_000,
+                mb_per_second: 125.0,
+            })
+            .unwrap();
+        done_tx.send(Ok(stopped_report())).unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert!(running.is_none());
+        assert_render_contains(&ui, "125.0 MB/s");
+    }
+
+    #[test]
+    fn finish_completed_run_preserves_pass_summaries_when_run_errors() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 1_000_000,
+            mb_per_second: 100.0,
+        });
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Read,
+            pass_number: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 500_000,
+            mb_per_second: 80.0,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        done_tx.send(Err(String::from("failed"))).unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert_render_contains(&ui, "write pass 1: Avg 100.0");
+        assert_render_contains(&ui, "Error - failed");
+    }
+
+    #[test]
     fn replace_running_stops_previous_run_before_replacement() {
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done) = mpsc::channel();
         done_tx.send(Ok(stopped_report())).unwrap();
         let mut running = Some(RunningBenchmark {
             stop: Arc::clone(&stop),
+            samples: mpsc::channel().1,
             done,
         });
 
@@ -223,5 +331,14 @@ mod tests {
         assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
         assert!(running.is_none());
+    }
+
+    fn assert_render_contains(ui: &TerminalUi, expected: &str) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).unwrap();
+
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+
+        assert!(terminal.backend().to_string().contains(expected));
     }
 }

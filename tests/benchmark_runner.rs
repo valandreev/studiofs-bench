@@ -129,6 +129,28 @@ fn runner_stops_between_files_without_truncating_next_file() {
     assert_eq!(std::fs::metadata(second_file).unwrap().len(), 1);
 }
 
+#[test]
+fn runner_reports_pass_progress_and_metrics_from_samples() {
+    let target = TestDir::new("studiofs-bench-sfs-575-progress");
+    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
+    config.test_mode = DiskTestMode::WriteOnly;
+    let workload =
+        Workload::create_for_bytes(target.path(), 100, FileLayout::HundredFilesPlusMinusFive)
+            .unwrap();
+    let mut samples = Vec::new();
+
+    let report = BenchmarkRunner::with_block_size(200)
+        .unwrap()
+        .run_workload(workload, &config, |sample| samples.push(sample), || false)
+        .unwrap();
+
+    assert_eq!(
+        samples.last().map(|sample| sample.bytes_processed),
+        Some(100)
+    );
+    assert_eq!(report.passes[0].metrics.sample_count, 100);
+}
+
 struct TestDir {
     path: PathBuf,
 }
