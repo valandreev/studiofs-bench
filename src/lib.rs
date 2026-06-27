@@ -153,30 +153,35 @@ impl TerminalUi {
             .bytes()
             .unwrap_or(sample.bytes_processed)
             .max(sample.bytes_processed);
-        let progress = self.progress.get_or_insert_with(|| LivePassProgress {
-            phase: sample.phase,
-            pass_number: sample.pass_number,
-            bytes_processed: 0,
-            total_bytes,
-            current_mb_per_second: 0.0,
-            metrics: MetricsAccumulator::default(),
+        let is_new_pass = self.progress.as_ref().is_none_or(|progress| {
+            progress.phase != sample.phase || progress.pass_number != sample.pass_number
         });
-
-        if progress.phase != sample.phase || progress.pass_number != sample.pass_number {
-            *progress = LivePassProgress {
+        if is_new_pass {
+            if let Some(progress) = self.progress.take() {
+                self.pass_summaries.push(BenchmarkPassReport {
+                    phase: progress.phase,
+                    pass_number: progress.pass_number,
+                    bytes_processed: progress.bytes_processed,
+                    stopped: false,
+                    metrics: progress.metrics.finish(),
+                });
+            }
+            self.progress = Some(LivePassProgress {
                 phase: sample.phase,
                 pass_number: sample.pass_number,
                 bytes_processed: 0,
                 total_bytes,
                 current_mb_per_second: 0.0,
                 metrics: MetricsAccumulator::default(),
-            };
+            });
         }
 
-        progress.total_bytes = progress.total_bytes.max(total_bytes);
-        progress.bytes_processed = sample.bytes_processed;
-        progress.current_mb_per_second = sample.mb_per_second;
-        progress.metrics.add(sample.mb_per_second);
+        if let Some(progress) = &mut self.progress {
+            progress.total_bytes = progress.total_bytes.max(total_bytes);
+            progress.bytes_processed = sample.bytes_processed;
+            progress.current_mb_per_second = sample.mb_per_second;
+            progress.metrics.add(sample.mb_per_second);
+        }
     }
 
     /// Marks the run as finished and displays completed pass summaries.
@@ -244,9 +249,11 @@ impl TerminalUi {
                 progress.bytes_processed as f64 / progress.total_bytes as f64
             }
             .clamp(0.0, 1.0);
+            let block = Block::new().title("Progress").borders(Borders::ALL);
+            let inner = block.inner(live);
             frame.render_widget(
                 Gauge::default()
-                    .block(Block::new().title("Progress").borders(Borders::ALL))
+                    .block(block)
                     .gauge_style(Style::new().fg(Color::Green))
                     .ratio(ratio),
                 live,
@@ -259,21 +266,15 @@ impl TerminalUi {
                     progress.current_mb_per_second
                 )),
                 Line::from(format!(
-                    "Pass {} - {} / {} MB",
+                    "Pass {} - {:.1} / {:.1} MB",
                     progress.pass_number,
-                    progress.bytes_processed / DECIMAL_MB,
-                    progress.total_bytes / DECIMAL_MB
+                    progress.bytes_processed as f64 / DECIMAL_MB as f64,
+                    progress.total_bytes as f64 / DECIMAL_MB as f64
                 )),
                 Line::from(format!("Avg {:.1}", metrics.average_mb_per_second)),
                 Line::from(format!("Stable {:.1}", metrics.stable_mb_per_second)),
             ];
-            frame.render_widget(
-                Paragraph::new(text),
-                live.inner(ratatui::layout::Margin {
-                    vertical: 1,
-                    horizontal: 1,
-                }),
-            );
+            frame.render_widget(Paragraph::new(text), inner);
         } else {
             frame.render_widget(
                 Paragraph::new("No samples yet")

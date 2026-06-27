@@ -166,3 +166,52 @@ fn terminal_ui_renders_live_progress_and_pass_summary_metrics() {
     assert!(output.contains("Min 90.0"));
     assert!(output.contains("Drops 1"));
 }
+
+#[test]
+fn terminal_ui_archives_completed_live_pass_when_next_pass_starts() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::Submit);
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Write,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 1_000_000,
+        mb_per_second: 100.0,
+    });
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Read,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 500_000,
+        mb_per_second: 80.0,
+    });
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("write pass 1: Avg 100.0"));
+    assert!(output.contains("Current read: 80.0 MB/s"));
+}
+
+#[test]
+fn terminal_ui_renders_progress_megabytes_with_fractional_precision() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::Submit);
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Write,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 500_000,
+        mb_per_second: 125.0,
+    });
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("0.5 /"));
+}
