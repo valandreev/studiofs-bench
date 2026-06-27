@@ -17,6 +17,7 @@ todo = "warn"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
