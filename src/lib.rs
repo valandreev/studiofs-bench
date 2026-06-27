@@ -262,8 +262,8 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, opening, reading, or
-    /// writing the benchmark file fails.
+    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// writing, or syncing the benchmark file fails.
     pub fn run(
         self,
         path: impl AsRef<std::path::Path>,
@@ -276,6 +276,7 @@ impl StreamingIoEngine {
             .unwrap_or(self.block_size)
             .min(self.block_size);
         let mut buffer = vec![0_u8; buffer_size];
+        fill_benchmark_buffer(&mut buffer);
         let mut report = StreamingIoReport::default();
 
         let mut output = File::create(path)?;
@@ -324,8 +325,12 @@ fn stream_write(
 
         let offset = processed;
         let chunk = chunk_len(buffer.len(), total_bytes - processed);
+        let is_final_chunk = processed + chunk as u64 == total_bytes;
         let io_start = Instant::now();
         output.write_all(&buffer[..chunk])?;
+        if is_final_chunk {
+            output.sync_all()?;
+        }
         elapsed_io += io_start.elapsed();
         processed += chunk as u64;
         on_sample(sample(
@@ -375,6 +380,15 @@ fn chunk_len(block_size: usize, remaining: u64) -> usize {
     usize::try_from(remaining)
         .unwrap_or(block_size)
         .min(block_size)
+}
+
+fn fill_benchmark_buffer(buffer: &mut [u8]) {
+    let mut state = 0x1234_5678_u32;
+
+    for byte in buffer {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (state >> 24) as u8;
+    }
 }
 
 #[expect(
@@ -455,7 +469,14 @@ impl fmt::Display for StreamingIoError {
     }
 }
 
-impl Error for StreamingIoError {}
+impl Error for StreamingIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ZeroBlockSize => None,
+            Self::Io(error) => Some(error),
+        }
+    }
+}
 
 impl From<std::io::Error> for StreamingIoError {
     fn from(error: std::io::Error) -> Self {
@@ -470,5 +491,22 @@ mod tests {
     #[test]
     fn chunk_len_keeps_large_remaining_sizes_in_u64_until_after_min() {
         assert_eq!(chunk_len(8 * 1024 * 1024, 1_u64 << 32), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fill_benchmark_buffer_uses_non_zero_deterministic_bytes() {
+        let mut buffer = [0_u8; 8];
+
+        fill_benchmark_buffer(&mut buffer);
+
+        assert_eq!(buffer, [117, 205, 37, 75, 132, 226, 234, 242]);
+    }
+
+    #[test]
+    fn streaming_io_error_exposes_io_source() {
+        let error =
+            StreamingIoError::from(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
