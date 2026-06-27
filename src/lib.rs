@@ -41,6 +41,7 @@ impl BenchmarkConfig {
     pub const THROUGHPUT_UNIT: &'static str = "MB/s";
 
     /// Creates a config with documented defaults for the required target path.
+    #[must_use]
     pub fn for_target(target_path: PathBuf) -> Self {
         Self {
             target_path,
@@ -55,6 +56,11 @@ impl BenchmarkConfig {
     }
 
     /// Rejects invalid values and cross-field combinations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the target path is empty, the workload size
+    /// is zero or overflows byte conversion, or a fixed file layout is invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.target_path.as_os_str().is_empty() {
             return Err(ConfigError::EmptyTargetPath);
@@ -100,6 +106,7 @@ pub enum WorkloadSize {
 
 impl WorkloadSize {
     /// Size in decimal gigabytes.
+    #[must_use]
     pub fn gigabytes(self) -> u64 {
         match self {
             Self::Preset(preset) => preset.gigabytes(),
@@ -108,11 +115,13 @@ impl WorkloadSize {
     }
 
     /// Size in decimal megabytes.
+    #[must_use]
     pub fn megabytes(self) -> Option<u64> {
         self.gigabytes().checked_mul(MB_PER_GB)
     }
 
     /// Size in decimal bytes.
+    #[must_use]
     pub fn bytes(self) -> Option<u64> {
         self.megabytes()?.checked_mul(DECIMAL_MB)
     }
@@ -134,6 +143,7 @@ pub enum WorkloadPreset {
 
 impl WorkloadPreset {
     /// Preset size in decimal gigabytes.
+    #[must_use]
     pub fn gigabytes(self) -> u64 {
         match self {
             Self::OneGb => 1,
@@ -233,6 +243,10 @@ impl Default for StreamingIoEngine {
 
 impl StreamingIoEngine {
     /// Creates an engine with a custom internal block size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::ZeroBlockSize`] when `block_size` is zero.
     pub fn with_block_size(block_size: usize) -> Result<Self, StreamingIoError> {
         if block_size == 0 {
             return Err(StreamingIoError::ZeroBlockSize);
@@ -242,6 +256,14 @@ impl StreamingIoEngine {
     }
 
     /// Runs one sequential write pass followed by one sequential read pass.
+    ///
+    /// Samples are emitted with `pass_number` set to `1` because this engine
+    /// executes one write/read pass pair per call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::Io`] when creating, opening, reading, or
+    /// writing the benchmark file fails.
     pub fn run(
         self,
         path: impl AsRef<std::path::Path>,
@@ -250,11 +272,9 @@ impl StreamingIoEngine {
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
-        let buffer_size = if total_bytes < self.block_size as u64 {
-            total_bytes as usize
-        } else {
-            self.block_size
-        };
+        let buffer_size = usize::try_from(total_bytes)
+            .unwrap_or(self.block_size)
+            .min(self.block_size);
         let mut buffer = vec![0_u8; buffer_size];
         let mut report = StreamingIoReport::default();
 
@@ -352,9 +372,15 @@ fn stream_read(
 }
 
 fn chunk_len(block_size: usize, remaining: u64) -> usize {
-    (block_size as u64).min(remaining) as usize
+    usize::try_from(remaining)
+        .unwrap_or(block_size)
+        .min(block_size)
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "throughput is an approximate human-facing metric"
+)]
 fn sample(
     phase: StreamingIoPhase,
     offset: u64,
