@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
@@ -250,7 +250,12 @@ impl StreamingIoEngine {
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
-        let buffer = vec![0_u8; self.block_size];
+        let buffer_size = if total_bytes < self.block_size as u64 {
+            total_bytes as usize
+        } else {
+            self.block_size
+        };
+        let mut buffer = vec![0_u8; buffer_size];
         let mut report = StreamingIoReport::default();
 
         let mut output = File::create(path)?;
@@ -271,7 +276,7 @@ impl StreamingIoEngine {
         let mut input = File::open(path)?;
         report.bytes_read = stream_read(
             &mut input,
-            self.block_size,
+            &mut buffer,
             total_bytes,
             &mut on_sample,
             &mut should_stop,
@@ -289,7 +294,7 @@ fn stream_write(
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
-    let started = Instant::now();
+    let mut elapsed_io = Duration::ZERO;
     let mut processed = 0;
 
     while processed < total_bytes {
@@ -298,10 +303,17 @@ fn stream_write(
         }
 
         let offset = processed;
-        let chunk = buffer.len().min((total_bytes - processed) as usize);
+        let chunk = chunk_len(buffer.len(), total_bytes - processed);
+        let io_start = Instant::now();
         output.write_all(&buffer[..chunk])?;
+        elapsed_io += io_start.elapsed();
         processed += chunk as u64;
-        on_sample(sample(StreamingIoPhase::Write, offset, processed, started));
+        on_sample(sample(
+            StreamingIoPhase::Write,
+            offset,
+            processed,
+            elapsed_io,
+        ));
     }
 
     Ok(processed)
@@ -309,13 +321,12 @@ fn stream_write(
 
 fn stream_read(
     input: &mut File,
-    block_size: usize,
+    buffer: &mut [u8],
     total_bytes: u64,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
-    let started = Instant::now();
-    let mut buffer = vec![0_u8; block_size];
+    let mut elapsed_io = Duration::ZERO;
     let mut processed = 0;
 
     while processed < total_bytes {
@@ -324,22 +335,33 @@ fn stream_read(
         }
 
         let offset = processed;
-        let chunk = buffer.len().min((total_bytes - processed) as usize);
+        let chunk = chunk_len(buffer.len(), total_bytes - processed);
+        let io_start = Instant::now();
         input.read_exact(&mut buffer[..chunk])?;
+        elapsed_io += io_start.elapsed();
         processed += chunk as u64;
-        on_sample(sample(StreamingIoPhase::Read, offset, processed, started));
+        on_sample(sample(
+            StreamingIoPhase::Read,
+            offset,
+            processed,
+            elapsed_io,
+        ));
     }
 
     Ok(processed)
+}
+
+fn chunk_len(block_size: usize, remaining: u64) -> usize {
+    (block_size as u64).min(remaining) as usize
 }
 
 fn sample(
     phase: StreamingIoPhase,
     offset: u64,
     bytes_processed: u64,
-    started: Instant,
+    elapsed_io: Duration,
 ) -> StreamingIoSample {
-    let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let elapsed = elapsed_io.as_secs_f64().max(f64::EPSILON);
 
     StreamingIoSample {
         phase,
@@ -412,5 +434,15 @@ impl Error for StreamingIoError {}
 impl From<std::io::Error> for StreamingIoError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_len_keeps_large_remaining_sizes_in_u64_until_after_min() {
+        assert_eq!(chunk_len(8 * 1024 * 1024, 1_u64 << 32), 8 * 1024 * 1024);
     }
 }

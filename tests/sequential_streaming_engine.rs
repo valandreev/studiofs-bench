@@ -1,14 +1,15 @@
 //! Sequential streaming engine tests.
 
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use studiofs_bench::{StreamingIoEngine, StreamingIoPhase};
 
 #[test]
 fn engine_writes_reads_and_reports_sequential_samples() {
-    let dir = std::env::temp_dir().join(format!("studiofs-bench-sfs-570-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("stream.bin");
+    let dir = TestDir::new("studiofs-bench-sfs-570");
+    let path = dir.path().join("stream.bin");
 
     let engine = StreamingIoEngine::with_block_size(4).unwrap();
     let mut samples = Vec::new();
@@ -34,18 +35,12 @@ fn engine_writes_reads_and_reports_sequential_samples() {
             (StreamingIoPhase::Read, 8, 10),
         ]
     );
-
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn engine_stops_between_blocks_without_starting_read_pass() {
-    let dir = std::env::temp_dir().join(format!(
-        "studiofs-bench-sfs-570-stop-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("stream.bin");
+    let dir = TestDir::new("studiofs-bench-sfs-570-stop");
+    let path = dir.path().join("stream.bin");
 
     let engine = StreamingIoEngine::with_block_size(4).unwrap();
     let mut samples = Vec::new();
@@ -73,6 +68,56 @@ fn engine_stops_between_blocks_without_starting_read_pass() {
             .collect::<Vec<_>>(),
         vec![StreamingIoPhase::Write]
     );
+}
 
-    fs::remove_dir_all(&dir).unwrap();
+#[test]
+fn engine_throughput_samples_exclude_callback_delay() {
+    let dir = TestDir::new("studiofs-bench-sfs-570-callback-delay");
+    let path = dir.path().join("stream.bin");
+
+    let engine = StreamingIoEngine::with_block_size(1).unwrap();
+    let mut samples = Vec::new();
+
+    engine
+        .run(
+            &path,
+            2,
+            |sample| {
+                samples.push(sample);
+                if samples.len() == 1 {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            },
+            || false,
+        )
+        .unwrap();
+
+    assert!(
+        samples[1].mb_per_second > 0.0001,
+        "callback delay contaminated throughput: {} MB/s",
+        samples[1].mb_per_second
+    );
+}
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
