@@ -31,35 +31,47 @@ fn main() -> io::Result<()> {
 fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     let mut ui = TerminalUi::default();
     let mut running: Option<RunningBenchmark> = None;
+    let mut should_render = true;
 
     while !ui.should_exit() {
-        finish_completed_run(&mut running, &mut ui);
+        if finish_completed_run(&mut running, &mut ui) {
+            should_render = true;
+        }
 
-        terminal.draw(|frame| ui.render(frame))?;
+        if should_render {
+            terminal.draw(|frame| ui.render(frame))?;
+            should_render = false;
+        }
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-        let was_running = ui.is_running();
-        if let Some(action) = key_action(key.code) {
-            ui.handle_action(action);
-        }
+                let was_running = ui.is_running();
+                if let Some(action) = key_action(key.code) {
+                    ui.handle_action(action);
+                    should_render = true;
+                }
 
-        if was_running && !ui.is_running() {
-            if let Some(run) = &running {
-                run.stop.store(true, Ordering::Relaxed);
+                if was_running && !ui.is_running() {
+                    if let Some(run) = &running {
+                        run.stop.store(true, Ordering::Relaxed);
+                    }
+                } else if !was_running && ui.is_running() {
+                    stop_running(running.take());
+                    running = Some(spawn_benchmark(ui.config().clone()));
+                }
             }
-        } else if !was_running && ui.is_running() {
-            stop_running(running.take());
-            running = Some(spawn_benchmark(ui.config().clone()));
+            Event::Resize(_, _) => {
+                should_render = true;
+            }
+            _ => {}
         }
     }
 
@@ -101,9 +113,9 @@ fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
     RunningBenchmark { stop, done }
 }
 
-fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut TerminalUi) {
+fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut TerminalUi) -> bool {
     let Some(run) = running else {
-        return;
+        return false;
     };
 
     match run.done.try_recv() {
@@ -114,19 +126,24 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
                 Err(error) => format!("Error - {error}"),
             });
             *running = None;
+            true
         }
         Err(mpsc::TryRecvError::Disconnected) => {
             ui.finish_run("Error - benchmark thread stopped unexpectedly");
             *running = None;
+            true
         }
-        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Empty) => false,
     }
 }
 
-fn stop_running(running: Option<RunningBenchmark>) {
+fn stop_running(running: Option<RunningBenchmark>) -> bool {
     if let Some(run) = running {
         run.stop.store(true, Ordering::Relaxed);
         let _ = run.done.recv();
+        true
+    } else {
+        false
     }
 }
 
@@ -151,11 +168,12 @@ mod tests {
 
         done_tx.send(Ok(stopped_report())).unwrap();
 
-        stop_running(Some(RunningBenchmark {
+        let completed = stop_running(Some(RunningBenchmark {
             stop: Arc::clone(&stop),
             done,
         }));
 
+        assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
     }
 
@@ -168,10 +186,26 @@ mod tests {
         drop(done_tx);
         let mut running = Some(RunningBenchmark { stop, done });
 
-        finish_completed_run(&mut running, &mut ui);
+        let changed = finish_completed_run(&mut running, &mut ui);
 
+        assert!(changed);
         assert!(running.is_none());
         assert!(!ui.is_running());
+    }
+
+    #[test]
+    fn finish_completed_run_returns_false_while_run_is_pending() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_done_tx, done) = mpsc::channel();
+        let mut running = Some(RunningBenchmark { stop, done });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(!changed);
+        assert!(running.is_some());
+        assert!(ui.is_running());
     }
 
     #[test]
@@ -184,8 +218,9 @@ mod tests {
             done,
         });
 
-        stop_running(running.take());
+        let completed = stop_running(running.take());
 
+        assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
         assert!(running.is_none());
     }

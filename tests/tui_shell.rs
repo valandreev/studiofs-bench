@@ -18,7 +18,7 @@ fn terminal_ui_shows_editable_benchmark_settings() {
     assert!(output.contains("Mode"));
     assert!(output.contains("Layout"));
     assert!(output.contains("Cache mode"));
-    assert!(output.contains("Run mode"));
+    assert!(output.contains("Execution mode"));
     assert!(output.contains("Keep files"));
     assert!(output.contains("Save report"));
 }

@@ -201,7 +201,7 @@ impl TerminalUi {
                 Cow::Borrowed(cache_mode_label(self.config.cache_mode)),
             ),
             (
-                "Run mode",
+                "Execution mode",
                 Cow::Borrowed(execution_mode_label(self.config.execution_mode)),
             ),
             (
@@ -225,7 +225,7 @@ impl TerminalUi {
                 self.config.file_layout = next_file_layout(self.config.file_layout, next)
             }
             CACHE_SETTING => self.config.cache_mode = next_cache_mode(self.config.cache_mode),
-            RUN_MODE_SETTING => {
+            EXECUTION_MODE_SETTING => {
                 self.config.execution_mode = next_execution_mode(self.config.execution_mode);
             }
             KEEP_FILES_SETTING => self.config.keep_files = !self.config.keep_files,
@@ -241,7 +241,7 @@ const WORKLOAD_SETTING: usize = 1;
 const MODE_SETTING: usize = 2;
 const LAYOUT_SETTING: usize = 3;
 const CACHE_SETTING: usize = 4;
-const RUN_MODE_SETTING: usize = 5;
+const EXECUTION_MODE_SETTING: usize = 5;
 const KEEP_FILES_SETTING: usize = 6;
 const SAVE_REPORT_SETTING: usize = 7;
 const SETTING_COUNT: usize = 8;
