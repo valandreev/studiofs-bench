@@ -217,7 +217,8 @@ impl Workload {
         let target_path = target_path.as_ref();
         let file_sizes = workload_file_sizes(total_bytes, file_layout)?;
         let run_dir = create_unique_run_dir(target_path)?;
-        let buffer = benchmark_buffer(total_bytes);
+        let max_file_size = file_sizes.iter().copied().max().unwrap_or(0);
+        let buffer = benchmark_buffer(max_file_size);
         let files = write_workload_files(&run_dir, file_sizes, |path, bytes| {
             write_workload_file(path, bytes, &buffer)
         })?;
@@ -286,16 +287,18 @@ fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
         return Err(WorkloadError::WorkloadTooSmallForLayout);
     }
 
-    let mut sizes = Vec::with_capacity(FILE_COUNT);
+    let mut sizes = vec![1; FILE_COUNT];
+    let weighted_bytes = total_bytes - FILE_COUNT as u64;
     let mut allocated = 0_u64;
-    for index in 0..FILE_COUNT {
+    for (index, size_slot) in sizes.iter_mut().enumerate() {
         let weight = 95 + index as u64 % 11;
-        let size = (u128::from(total_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
+        let size =
+            (u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
         allocated += size;
-        sizes.push(size);
+        *size_slot += size;
     }
 
-    let mut remainder = total_bytes - allocated;
+    let mut remainder = weighted_bytes - allocated;
     for size in &mut sizes {
         if remainder == 0 {
             break;
@@ -319,13 +322,14 @@ fn fixed_file_sizes(total_bytes: u64, file_size_mb: u64) -> Result<Vec<u64>, Wor
         return Err(ConfigError::FileLayoutExceedsWorkload.into());
     }
 
-    let capacity = usize::try_from(total_bytes.div_ceil(file_bytes)).unwrap_or(0);
-    let mut sizes = Vec::with_capacity(capacity);
-    let mut remaining = total_bytes;
-    while remaining > 0 {
-        let size = remaining.min(file_bytes);
-        sizes.push(size);
-        remaining -= size;
+    let capacity = usize::try_from(total_bytes.div_ceil(file_bytes))
+        .map_err(|_| ConfigError::WorkloadOverflow)?;
+    let mut sizes = vec![file_bytes; capacity];
+    if let Some(last) = sizes.last_mut() {
+        let remainder = total_bytes % file_bytes;
+        if remainder != 0 {
+            *last = remainder;
+        }
     }
 
     Ok(sizes)
@@ -378,11 +382,11 @@ fn benchmark_buffer(total_bytes: u64) -> Vec<u8> {
     buffer
 }
 
-fn write_workload_file(path: &Path, total_bytes: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
+fn write_workload_file(path: &Path, file_size: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
     let mut file = File::create(path)?;
     let mut written = 0_u64;
-    while written < total_bytes {
-        let chunk = chunk_len(buffer.len(), total_bytes - written);
+    while written < file_size {
+        let chunk = chunk_len(buffer.len(), file_size - written);
         file.write_all(&buffer[..chunk])?;
         written += chunk as u64;
     }
@@ -924,6 +928,14 @@ mod tests {
         let sizes = hundred_file_sizes(u64::MAX).unwrap();
 
         assert_eq!(sizes.iter().sum::<u64>(), u64::MAX);
+    }
+
+    #[test]
+    fn hundred_file_sizes_keep_exact_total_near_minimum_size() {
+        let sizes = hundred_file_sizes(101).unwrap();
+
+        assert_eq!(sizes.iter().sum::<u64>(), 101);
+        assert!(sizes.iter().all(|size| *size > 0));
     }
 
     #[test]
