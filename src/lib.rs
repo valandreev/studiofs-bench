@@ -15,6 +15,7 @@ use serde::Serialize;
 const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
 const DEFAULT_STREAMING_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FIXED_LAYOUT_FILES: usize = 100_000;
 const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
 static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -250,8 +251,11 @@ impl Workload {
     ///
     /// Returns [`WorkloadError`] when removing the run directory fails.
     pub fn cleanup(self) -> Result<(), WorkloadError> {
-        std::fs::remove_dir_all(self.run_dir)?;
-        Ok(())
+        match std::fs::remove_dir_all(self.run_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -324,6 +328,9 @@ fn fixed_file_sizes(total_bytes: u64, file_size_mb: u64) -> Result<Vec<u64>, Wor
 
     let capacity = usize::try_from(total_bytes.div_ceil(file_bytes))
         .map_err(|_| ConfigError::WorkloadOverflow)?;
+    if capacity > MAX_FIXED_LAYOUT_FILES {
+        return Err(ConfigError::WorkloadOverflow.into());
+    }
     let mut sizes = vec![file_bytes; capacity];
     if let Some(last) = sizes.last_mut() {
         let remainder = total_bytes % file_bytes;
@@ -390,7 +397,6 @@ fn write_workload_file(path: &Path, file_size: u64, buffer: &[u8]) -> Result<(),
         file.write_all(&buffer[..chunk])?;
         written += chunk as u64;
     }
-    file.sync_all()?;
 
     Ok(())
 }
@@ -936,6 +942,30 @@ mod tests {
 
         assert_eq!(sizes.iter().sum::<u64>(), 101);
         assert!(sizes.iter().all(|size| *size > 0));
+    }
+
+    #[test]
+    fn fixed_file_sizes_rejects_too_many_files() {
+        let error = fixed_file_sizes(100_001 * DECIMAL_MB, 1).unwrap_err();
+
+        assert_eq!(error.to_string(), "workload size is too large");
+    }
+
+    #[test]
+    fn cleanup_ignores_missing_run_dir() {
+        let target = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+
+        let workload = Workload::create_for_bytes(&target, 1, FileLayout::SingleFile).unwrap();
+        let run_dir = workload.run_dir().to_owned();
+        std::fs::remove_dir_all(&run_dir).unwrap();
+
+        assert!(workload.cleanup().is_ok());
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]
