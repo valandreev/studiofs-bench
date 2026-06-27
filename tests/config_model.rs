@@ -16,7 +16,7 @@ fn default_config_uses_documented_benchmark_contract() {
     assert_eq!(config.workload_size.megabytes(), Some(4_000));
     assert_eq!(config.run_mode, RunMode::LocalFilesystem);
     assert_eq!(config.file_layout, FileLayout::SingleFile);
-    assert_eq!(config.cache_mode, CacheMode::Warm);
+    assert_eq!(config.cache_mode, CacheMode::Enabled);
     assert!(!config.keep_files);
     assert!(config.save_report);
     assert_eq!(config.execution_mode, ExecutionMode::RunOnce);
@@ -82,7 +82,7 @@ fn config_serializes_report_ready_values() {
     let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
     config.workload_size = WorkloadSize::CustomGb(16);
     config.run_mode = RunMode::MountedFilesystem;
-    config.cache_mode = CacheMode::Cold;
+    config.cache_mode = CacheMode::Disabled;
     config.keep_files = true;
     config.save_report = false;
     config.execution_mode = ExecutionMode::Continuous;
@@ -92,7 +92,7 @@ fn config_serializes_report_ready_values() {
     assert_eq!(value["workload_size"]["custom_gb"], 16);
     assert_eq!(value["run_mode"], "mounted_filesystem");
     assert_eq!(value["file_layout"], "single_file");
-    assert_eq!(value["cache_mode"], "cold");
+    assert_eq!(value["cache_mode"], "disabled");
     assert_eq!(value["keep_files"], true);
     assert_eq!(value["save_report"], false);
     assert_eq!(value["execution_mode"], "continuous");
