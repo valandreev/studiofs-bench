@@ -13,7 +13,8 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, TerminalUi, UiAction,
+    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, StreamingIoSample, TerminalUi,
+    UiAction,
 };
 
 fn main() -> io::Result<()> {
@@ -34,6 +35,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     let mut should_render = true;
 
     while !ui.should_exit() {
+        if let Some(run) = &running {
+            for sample in run.samples.try_iter() {
+                ui.observe_sample(sample);
+                should_render = true;
+            }
+        }
+
         if finish_completed_run(&mut running, &mut ui) {
             should_render = true;
         }
@@ -95,22 +103,34 @@ fn key_action(code: KeyCode) -> Option<UiAction> {
 
 struct RunningBenchmark {
     stop: Arc<AtomicBool>,
+    samples: Receiver<StreamingIoSample>,
     done: Receiver<Result<BenchmarkRunnerReport, String>>,
 }
 
 fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
     let stop = Arc::new(AtomicBool::new(false));
     let should_stop = Arc::clone(&stop);
+    let (sample_tx, samples) = mpsc::channel();
     let (done_tx, done) = mpsc::channel();
 
     thread::spawn(move || {
         let result = BenchmarkRunner::default()
-            .run(&config, |_| {}, || should_stop.load(Ordering::Relaxed))
+            .run(
+                &config,
+                |sample| {
+                    let _ = sample_tx.send(sample);
+                },
+                || should_stop.load(Ordering::Relaxed),
+            )
             .map_err(|error| error.to_string());
         let _ = done_tx.send(result);
     });
 
-    RunningBenchmark { stop, done }
+    RunningBenchmark {
+        stop,
+        samples,
+        done,
+    }
 }
 
 fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut TerminalUi) -> bool {
@@ -120,11 +140,14 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
 
     match run.done.try_recv() {
         Ok(result) => {
-            ui.finish_run(match result {
-                Ok(report) if report.stopped => String::from("Stopped"),
-                Ok(report) => format!("Done - {} passes", report.passes.len()),
-                Err(error) => format!("Error - {error}"),
-            });
+            ui.finish_run_with_passes(
+                match &result {
+                    Ok(report) if report.stopped => String::from("Stopped"),
+                    Ok(report) => format!("Done - {} passes", report.passes.len()),
+                    Err(error) => format!("Error - {error}"),
+                },
+                result.ok().map_or_else(Vec::new, |report| report.passes),
+            );
             *running = None;
             true
         }
@@ -170,6 +193,7 @@ mod tests {
 
         let completed = stop_running(Some(RunningBenchmark {
             stop: Arc::clone(&stop),
+            samples: mpsc::channel().1,
             done,
         }));
 
@@ -184,7 +208,11 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done) = mpsc::channel();
         drop(done_tx);
-        let mut running = Some(RunningBenchmark { stop, done });
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples: mpsc::channel().1,
+            done,
+        });
 
         let changed = finish_completed_run(&mut running, &mut ui);
 
@@ -199,7 +227,11 @@ mod tests {
         ui.handle_action(UiAction::Submit);
         let stop = Arc::new(AtomicBool::new(false));
         let (_done_tx, done) = mpsc::channel();
-        let mut running = Some(RunningBenchmark { stop, done });
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples: mpsc::channel().1,
+            done,
+        });
 
         let changed = finish_completed_run(&mut running, &mut ui);
 
@@ -215,6 +247,7 @@ mod tests {
         done_tx.send(Ok(stopped_report())).unwrap();
         let mut running = Some(RunningBenchmark {
             stop: Arc::clone(&stop),
+            samples: mpsc::channel().1,
             done,
         });
 

@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 
 use ratatui::{Terminal, backend::TestBackend};
-use studiofs_bench::{CacheMode, DiskTestMode, ExecutionMode, FileLayout, TerminalUi, UiAction};
+use studiofs_bench::{
+    BenchmarkPassMetrics, BenchmarkPassReport, CacheMode, DiskTestMode, ExecutionMode, FileLayout,
+    StreamingIoPhase, StreamingIoSample, TerminalUi, UiAction,
+};
 
 #[test]
 fn terminal_ui_shows_editable_benchmark_settings() {
@@ -121,4 +124,45 @@ fn terminal_ui_finish_run_returns_to_idle() {
     ui.finish_run("Done");
 
     assert!(!ui.is_running());
+}
+
+#[test]
+fn terminal_ui_renders_live_progress_and_pass_summary_metrics() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::Submit);
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Write,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 500_000_000,
+        mb_per_second: 125.0,
+    });
+    ui.finish_run_with_passes(
+        "Done",
+        vec![BenchmarkPassReport {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            bytes_processed: 1_000_000_000,
+            stopped: false,
+            metrics: BenchmarkPassMetrics {
+                sample_count: 2,
+                average_mb_per_second: 110.0,
+                stable_mb_per_second: 120.0,
+                minimum_mb_per_second: 90.0,
+                drop_count: 1,
+            },
+        }],
+    );
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("Current write"));
+    assert!(output.contains("125.0 MB/s"));
+    assert!(output.contains("Avg 110.0"));
+    assert!(output.contains("Stable 120.0"));
+    assert!(output.contains("Min 90.0"));
+    assert!(output.contains("Drops 1"));
 }
