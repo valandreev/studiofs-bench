@@ -218,7 +218,7 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {}
 
 /// Sequential streaming write/read engine.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone)]
 pub struct StreamingIoEngine {
     block_size: usize,
 }
@@ -298,7 +298,7 @@ fn stream_write(
         }
 
         let offset = processed;
-        let chunk = next_chunk_len(buffer.len(), total_bytes - processed);
+        let chunk = buffer.len().min((total_bytes - processed) as usize);
         output.write_all(&buffer[..chunk])?;
         processed += chunk as u64;
         on_sample(sample(StreamingIoPhase::Write, offset, processed, started));
@@ -324,17 +324,13 @@ fn stream_read(
         }
 
         let offset = processed;
-        let chunk = next_chunk_len(buffer.len(), total_bytes - processed);
+        let chunk = buffer.len().min((total_bytes - processed) as usize);
         input.read_exact(&mut buffer[..chunk])?;
         processed += chunk as u64;
         on_sample(sample(StreamingIoPhase::Read, offset, processed, started));
     }
 
     Ok(processed)
-}
-
-fn next_chunk_len(block_size: usize, remaining: u64) -> usize {
-    block_size.min(remaining as usize)
 }
 
 fn sample(
@@ -366,7 +362,7 @@ pub enum StreamingIoPhase {
 }
 
 /// Structured progress sample emitted after a block completes.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamingIoSample {
     /// Phase that emitted the sample.
     pub phase: StreamingIoPhase,
@@ -383,7 +379,7 @@ pub struct StreamingIoSample {
 }
 
 /// Summary returned by one sequential streaming run.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Copy, Clone, Serialize)]
 pub struct StreamingIoReport {
     /// Bytes written during the write pass.
     pub bytes_written: u64,
