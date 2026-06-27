@@ -2,6 +2,18 @@
 
 Terminal benchmark binary for StudioFS benchmark experiments.
 
+## Default benchmark configuration
+
+- Target path: required.
+- Workload size: 4 GB, using decimal storage units.
+- Run mode: local filesystem.
+- File layout: single file.
+- Cache mode: warm.
+- Keep files: disabled.
+- Save report: enabled.
+- Execution: run once.
+- Throughput unit: MB/s.
+
 ## Development
 
 Build:
