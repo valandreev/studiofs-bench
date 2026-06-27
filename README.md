@@ -8,11 +8,29 @@ Terminal benchmark binary for StudioFS benchmark experiments.
 - Workload size: 4 GB, using decimal storage units.
 - Run mode: local filesystem.
 - File layout: single file.
-- Cache mode: warm.
+- Cache mode: enabled.
 - Keep files: disabled.
 - Save report: enabled.
 - Execution: run once.
 - Throughput unit: MB/s.
+
+## Cache control
+
+- `enabled`: normal platform file I/O.
+- `disabled`: best-effort per-file cache-reduced I/O.
+
+Platform methods recorded in report metadata:
+
+- Windows: write-through file flag.
+- macOS: `F_NOCACHE`.
+- Linux: `posix_fadvise(..., POSIX_FADV_DONTNEED)`.
+- Other targets: unavailable best-effort marker.
+
+Manual platform check:
+
+```bash
+cargo test --test config_model --test sequential_streaming_engine
+```
 
 ## Development
 

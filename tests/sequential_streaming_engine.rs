@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use studiofs_bench::{StreamingIoEngine, StreamingIoPhase};
+use studiofs_bench::{CacheControlMethod, CacheMode, StreamingIoEngine, StreamingIoPhase};
 
 #[test]
 fn engine_writes_reads_and_reports_sequential_samples() {
@@ -98,6 +98,43 @@ fn engine_throughput_samples_exclude_callback_delay() {
         "callback delay contaminated throughput: {} MB/s",
         samples[1].mb_per_second
     );
+}
+
+#[test]
+fn engine_records_disabled_cache_method_in_report_metadata() {
+    let dir = TestDir::new("studiofs-bench-sfs-571-cache-disabled");
+    let path = dir.path().join("stream.bin");
+
+    let engine = StreamingIoEngine::with_block_size(4).unwrap();
+
+    let report = engine
+        .run_with_cache_mode(&path, 8, CacheMode::Disabled, |_| {}, || false)
+        .unwrap();
+
+    assert_eq!(
+        (report.metadata.cache_mode, report.metadata.cache_method),
+        (CacheMode::Disabled, expected_disabled_cache_method())
+    );
+}
+
+#[cfg(windows)]
+fn expected_disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::WriteThrough
+}
+
+#[cfg(target_os = "macos")]
+fn expected_disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::FcntlNoCache
+}
+
+#[cfg(target_os = "linux")]
+fn expected_disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::PosixFadviseDontNeed
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn expected_disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::BestEffortUnavailable
 }
 
 struct TestDir {

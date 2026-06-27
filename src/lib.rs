@@ -4,7 +4,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,7 +48,7 @@ impl BenchmarkConfig {
             workload_size: WorkloadSize::Preset(WorkloadPreset::FourGb),
             run_mode: RunMode::LocalFilesystem,
             file_layout: FileLayout::SingleFile,
-            cache_mode: CacheMode::Warm,
+            cache_mode: CacheMode::Enabled,
             keep_files: false,
             save_report: true,
             execution_mode: ExecutionMode::RunOnce,
@@ -180,10 +180,26 @@ pub enum FileLayout {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
-    /// Run with cold-cache expectations.
-    Cold,
-    /// Run with warm-cache expectations.
-    Warm,
+    /// Run with normal platform file I/O.
+    Enabled,
+    /// Attempt standard best-effort cache-reduced platform I/O.
+    Disabled,
+}
+
+/// Platform mechanism selected for cache behavior.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheControlMethod {
+    /// Normal platform file I/O.
+    NormalFileIo,
+    /// Windows write-through file flag.
+    WriteThrough,
+    /// macOS `F_NOCACHE` file descriptor flag.
+    FcntlNoCache,
+    /// Linux `posix_fadvise(..., POSIX_FADV_DONTNEED)` hints.
+    PosixFadviseDontNeed,
+    /// No standard per-file best-effort method is implemented for this target.
+    BestEffortUnavailable,
 }
 
 /// Execution lifetime for the benchmark runner.
@@ -271,6 +287,29 @@ impl StreamingIoEngine {
         mut on_sample: impl FnMut(StreamingIoSample),
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
+        self.run_with_cache_mode(
+            path,
+            total_bytes,
+            CacheMode::Enabled,
+            &mut on_sample,
+            &mut should_stop,
+        )
+    }
+
+    /// Runs one sequential write/read pass with the requested cache behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// writing, or syncing the benchmark file fails.
+    pub fn run_with_cache_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        total_bytes: u64,
+        cache_mode: CacheMode,
+        mut on_sample: impl FnMut(StreamingIoSample),
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
         let buffer_size = usize::try_from(total_bytes)
             .unwrap_or(self.block_size)
@@ -279,7 +318,11 @@ impl StreamingIoEngine {
         fill_benchmark_buffer(&mut buffer);
         let mut report = StreamingIoReport::default();
 
-        let mut output = File::create(path)?;
+        let cache_control = CacheControl::new(cache_mode);
+        report.metadata.cache_mode = cache_mode;
+        report.metadata.cache_method = cache_control.method();
+
+        let mut output = cache_control.create(path)?;
         report.bytes_written = stream_write(
             &mut output,
             &buffer,
@@ -287,14 +330,16 @@ impl StreamingIoEngine {
             &mut on_sample,
             &mut should_stop,
         )?;
-        drop(output);
 
         if report.bytes_written < total_bytes {
             report.stopped = true;
             return Ok(report);
         }
 
-        let mut input = File::open(path)?;
+        cache_control.after_write(&output);
+        drop(output);
+
+        let mut input = cache_control.open(path)?;
         report.bytes_read = stream_read(
             &mut input,
             &mut buffer,
@@ -302,10 +347,120 @@ impl StreamingIoEngine {
             &mut on_sample,
             &mut should_stop,
         )?;
+        cache_control.after_read(&input);
         report.stopped = report.bytes_read < total_bytes;
 
         Ok(report)
     }
+}
+
+struct CacheControl {
+    mode: CacheMode,
+}
+
+impl CacheControl {
+    fn new(mode: CacheMode) -> Self {
+        Self { mode }
+    }
+
+    fn method(&self) -> CacheControlMethod {
+        match self.mode {
+            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
+            CacheMode::Disabled => disabled_cache_method(),
+        }
+    }
+
+    fn create(&self, path: &std::path::Path) -> Result<File, StreamingIoError> {
+        create_file(path, self.mode)
+    }
+
+    fn open(&self, path: &std::path::Path) -> Result<File, StreamingIoError> {
+        open_file(path, self.mode)
+    }
+
+    fn after_write(&self, file: &File) {
+        after_cache_io(file, self.mode);
+    }
+
+    fn after_read(&self, file: &File) {
+        after_cache_io(file, self.mode);
+    }
+}
+
+fn create_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    apply_open_options(&mut options, mode);
+    Ok(options.open(path)?)
+}
+
+fn open_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_open_options(&mut options, mode);
+    let file = options.open(path)?;
+    apply_file_options(&file, mode);
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn apply_open_options(options: &mut OpenOptions, mode: CacheMode) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+
+    if mode == CacheMode::Disabled {
+        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_open_options(_options: &mut OpenOptions, _mode: CacheMode) {}
+
+#[cfg(target_os = "macos")]
+fn apply_file_options(file: &File, mode: CacheMode) {
+    use std::os::fd::AsRawFd;
+
+    if mode == CacheMode::Disabled {
+        // SAFETY: `file` owns a valid file descriptor and `F_NOCACHE` expects an int flag.
+        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_file_options(_file: &File, _mode: CacheMode) {}
+
+#[cfg(target_os = "linux")]
+fn after_cache_io(file: &File, mode: CacheMode) {
+    use std::os::fd::AsRawFd;
+
+    if mode == CacheMode::Disabled {
+        // SAFETY: `file` owns a valid file descriptor. This is an advisory best-effort hint.
+        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn after_cache_io(_file: &File, _mode: CacheMode) {}
+
+#[cfg(windows)]
+fn disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::WriteThrough
+}
+
+#[cfg(target_os = "macos")]
+fn disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::FcntlNoCache
+}
+
+#[cfg(target_os = "linux")]
+fn disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::PosixFadviseDontNeed
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn disabled_cache_method() -> CacheControlMethod {
+    CacheControlMethod::BestEffortUnavailable
 }
 
 fn stream_write(
@@ -443,12 +598,32 @@ pub struct StreamingIoSample {
 /// Summary returned by one sequential streaming run.
 #[derive(Debug, Default, Copy, Clone, Serialize)]
 pub struct StreamingIoReport {
+    /// Report metadata for the run.
+    pub metadata: StreamingIoReportMetadata,
     /// Bytes written during the write pass.
     pub bytes_written: u64,
     /// Bytes read during the read pass.
     pub bytes_read: u64,
     /// Whether the caller requested a clean stop between blocks.
     pub stopped: bool,
+}
+
+/// Metadata describing selected benchmark run behavior.
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct StreamingIoReportMetadata {
+    /// Requested cache mode.
+    pub cache_mode: CacheMode,
+    /// Platform cache-control method selected for the request.
+    pub cache_method: CacheControlMethod,
+}
+
+impl Default for StreamingIoReportMetadata {
+    fn default() -> Self {
+        Self {
+            cache_mode: CacheMode::Enabled,
+            cache_method: CacheControlMethod::NormalFileIo,
+        }
+    }
 }
 
 /// Sequential streaming engine error.
