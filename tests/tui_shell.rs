@@ -27,9 +27,9 @@ fn terminal_ui_shows_editable_benchmark_settings() {
 fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
     let mut ui = TerminalUi::default();
 
-    ui.handle_action(UiAction::InsertText(
-        PathBuf::from("/tmp/bench").display().to_string(),
-    ));
+    for value in "/tmp/bench".chars() {
+        ui.handle_action(UiAction::InsertText(value));
+    }
     for _ in 0..7 {
         ui.handle_action(UiAction::MoveDown);
         ui.handle_action(UiAction::NextValue);
@@ -50,11 +50,32 @@ fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
 fn terminal_ui_appends_target_path_characters_as_text() {
     let mut ui = TerminalUi::default();
 
-    for value in ["/", "t", "m", "p"] {
-        ui.handle_action(UiAction::InsertText(value.to_owned()));
+    for value in "/tmp".chars() {
+        ui.handle_action(UiAction::InsertText(value));
     }
 
     assert_eq!(ui.config().target_path, PathBuf::from("/tmp"));
+}
+
+#[test]
+fn terminal_ui_ignores_setting_edits_while_running() {
+    let mut ui = TerminalUi::default();
+    let before = ui.config().clone();
+
+    ui.handle_action(UiAction::Submit);
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::NextValue);
+    ui.handle_action(UiAction::InsertText('x'));
+    ui.handle_action(UiAction::Backspace);
+
+    assert_eq!(ui.config(), &before);
+}
+
+#[test]
+fn terminal_ui_defaults_to_current_directory_target() {
+    let ui = TerminalUi::default();
+
+    assert_eq!(ui.config().target_path, PathBuf::from("."));
 }
 
 #[test]

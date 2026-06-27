@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -37,8 +38,8 @@ pub enum UiAction {
     PreviousValue,
     /// Select the next value for the current setting.
     NextValue,
-    /// Append text to the target path field.
-    InsertText(String),
+    /// Append a character to the target path field.
+    InsertText(char),
     /// Remove one character from the target path field.
     Backspace,
     /// Start or stop the benchmark.
@@ -60,7 +61,7 @@ pub struct TerminalUi {
 impl Default for TerminalUi {
     fn default() -> Self {
         Self {
-            config: BenchmarkConfig::for_target(PathBuf::new()),
+            config: BenchmarkConfig::for_target(PathBuf::from(".")),
             selected: 0,
             running: false,
             exit: false,
@@ -90,6 +91,10 @@ impl TerminalUi {
 
     /// Applies one keyboard action to the UI state.
     pub fn handle_action(&mut self, action: UiAction) {
+        if self.running && !matches!(action, UiAction::Submit | UiAction::Cancel) {
+            return;
+        }
+
         match action {
             UiAction::MoveUp => {
                 self.selected = self.selected.saturating_sub(1);
@@ -99,9 +104,13 @@ impl TerminalUi {
             }
             UiAction::PreviousValue => self.change_selected(false),
             UiAction::NextValue => self.change_selected(true),
-            UiAction::InsertText(text) if self.selected == TARGET_SETTING => {
-                let mut path = self.config.target_path.display().to_string();
-                path.push_str(&text);
+            UiAction::InsertText(value) if self.selected == TARGET_SETTING => {
+                let mut path = if self.config.target_path == Path::new(".") {
+                    String::new()
+                } else {
+                    self.config.target_path.display().to_string()
+                };
+                path.push(value);
                 self.config.target_path = PathBuf::from(path);
             }
             UiAction::Backspace if self.selected == TARGET_SETTING => {
@@ -175,30 +184,39 @@ impl TerminalUi {
         );
     }
 
-    fn setting_rows(&self) -> [(&'static str, String); SETTING_COUNT] {
+    fn setting_rows(&self) -> [(&'static str, Cow<'static, str>); SETTING_COUNT] {
         [
-            ("Target path", self.config.target_path.display().to_string()),
+            (
+                "Target path",
+                Cow::Owned(self.config.target_path.display().to_string()),
+            ),
             (
                 "Workload size",
-                workload_size_label(self.config.workload_size).to_owned(),
+                Cow::Borrowed(workload_size_label(self.config.workload_size)),
             ),
-            ("Mode", test_mode_label(self.config.test_mode).to_owned()),
+            (
+                "Mode",
+                Cow::Borrowed(test_mode_label(self.config.test_mode)),
+            ),
             (
                 "Layout",
-                file_layout_label(self.config.file_layout).to_owned(),
+                Cow::Borrowed(file_layout_label(self.config.file_layout)),
             ),
             (
                 "Cache mode",
-                cache_mode_label(self.config.cache_mode).to_owned(),
+                Cow::Borrowed(cache_mode_label(self.config.cache_mode)),
             ),
             (
                 "Run mode",
-                execution_mode_label(self.config.execution_mode).to_owned(),
+                Cow::Borrowed(execution_mode_label(self.config.execution_mode)),
             ),
-            ("Keep files", bool_label(self.config.keep_files).to_owned()),
+            (
+                "Keep files",
+                Cow::Borrowed(bool_label(self.config.keep_files)),
+            ),
             (
                 "Save report",
-                bool_label(self.config.save_report).to_owned(),
+                Cow::Borrowed(bool_label(self.config.save_report)),
             ),
         ]
     }
@@ -753,6 +771,7 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 fn cycle<T: Copy + PartialEq>(value: T, values: &[T], next: bool) -> T {
+    assert!(!values.is_empty(), "cannot cycle through an empty slice");
     let index = values.iter().position(|item| *item == value).unwrap_or(0);
     let index = if next {
         (index + 1) % values.len()

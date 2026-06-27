@@ -71,6 +71,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         }
     }
 
+    stop_running(running);
     Ok(())
 }
 
@@ -83,7 +84,7 @@ fn key_action(code: KeyCode) -> Option<UiAction> {
         KeyCode::Enter => Some(UiAction::Submit),
         KeyCode::Esc => Some(UiAction::Cancel),
         KeyCode::Backspace => Some(UiAction::Backspace),
-        KeyCode::Char(value) => Some(UiAction::InsertText(value.to_string())),
+        KeyCode::Char(value) => Some(UiAction::InsertText(value)),
         _ => None,
     }
 }
@@ -106,4 +107,39 @@ fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
     });
 
     RunningBenchmark { stop, done }
+}
+
+fn stop_running(running: Option<RunningBenchmark>) {
+    if let Some(run) = running {
+        run.stop.store(true, Ordering::Relaxed);
+        let _ = run.done.recv();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_running_requests_stop_and_waits_for_completion() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done) = mpsc::channel();
+
+        done_tx
+            .send(Ok(BenchmarkRunnerReport {
+                run_dir: ".".into(),
+                files_kept: false,
+                cleanup_error: None,
+                passes: Vec::new(),
+                stopped: true,
+            }))
+            .unwrap();
+
+        stop_running(Some(RunningBenchmark {
+            stop: Arc::clone(&stop),
+            done,
+        }));
+
+        assert!(stop.load(Ordering::Relaxed));
+    }
 }
