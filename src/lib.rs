@@ -173,6 +173,7 @@ impl TerminalUi {
             };
         }
 
+        progress.total_bytes = progress.total_bytes.max(total_bytes);
         progress.bytes_processed = sample.bytes_processed;
         progress.current_mb_per_second = sample.mb_per_second;
         progress.metrics.add(sample.mb_per_second);
@@ -281,27 +282,21 @@ impl TerminalUi {
             );
         }
 
-        let rows = self
-            .pass_summaries
-            .iter()
-            .flat_map(|pass| {
-                let metrics = pass.metrics;
-                [
-                    ListItem::new(Line::from(format!(
-                        "{} pass {}: Avg {:.1}",
-                        phase_label(pass.phase),
-                        pass.pass_number,
-                        metrics.average_mb_per_second
-                    ))),
-                    ListItem::new(Line::from(format!(
-                        "Stable {:.1}  Min {:.1}  Drops {}",
-                        metrics.stable_mb_per_second,
-                        metrics.minimum_mb_per_second,
-                        metrics.drop_count
-                    ))),
-                ]
-            })
-            .collect::<Vec<_>>();
+        let rows = self.pass_summaries.iter().flat_map(|pass| {
+            let metrics = pass.metrics;
+            [
+                ListItem::new(Line::from(format!(
+                    "{} pass {}: Avg {:.1}",
+                    phase_label(pass.phase),
+                    pass.pass_number,
+                    metrics.average_mb_per_second
+                ))),
+                ListItem::new(Line::from(format!(
+                    "Stable {:.1}  Min {:.1}  Drops {}",
+                    metrics.stable_mb_per_second, metrics.minimum_mb_per_second, metrics.drop_count
+                ))),
+            ]
+        });
         frame.render_widget(
             List::new(rows).block(Block::new().title("Pass summaries").borders(Borders::ALL)),
             summary,
@@ -1885,6 +1880,31 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminal_ui_updates_unknown_total_bytes_from_later_samples() {
+        let mut ui = TerminalUi::default();
+        ui.config.workload_size = WorkloadSize::CustomGb(u64::MAX);
+
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 0,
+            mb_per_second: 0.0,
+        });
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 10 * DECIMAL_MB,
+            mb_per_second: 100.0,
+        });
+
+        assert_eq!(ui.progress.unwrap().total_bytes, 10 * DECIMAL_MB);
     }
 
     #[test]

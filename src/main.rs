@@ -140,6 +140,9 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
 
     match run.done.try_recv() {
         Ok(result) => {
+            for sample in run.samples.try_iter() {
+                ui.observe_sample(sample);
+            }
             ui.finish_run_with_passes(
                 match &result {
                     Ok(report) if report.stopped => String::from("Stopped"),
@@ -173,6 +176,7 @@ fn stop_running(running: Option<RunningBenchmark>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_bench::StreamingIoPhase;
 
     fn stopped_report() -> BenchmarkRunnerReport {
         BenchmarkRunnerReport {
@@ -241,6 +245,37 @@ mod tests {
     }
 
     #[test]
+    fn finish_completed_run_drains_final_samples_before_clearing_run() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        sample_tx
+            .send(StreamingIoSample {
+                phase: StreamingIoPhase::Write,
+                pass_number: 1,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                offset: 0,
+                bytes_processed: 500_000_000,
+                mb_per_second: 125.0,
+            })
+            .unwrap();
+        done_tx.send(Ok(stopped_report())).unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert!(running.is_none());
+        assert_render_contains(&ui, "125.0 MB/s");
+    }
+
+    #[test]
     fn replace_running_stops_previous_run_before_replacement() {
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done) = mpsc::channel();
@@ -256,5 +291,14 @@ mod tests {
         assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
         assert!(running.is_none());
+    }
+
+    fn assert_render_contains(ui: &TerminalUi, expected: &str) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).unwrap();
+
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+
+        assert!(terminal.backend().to_string().contains(expected));
     }
 }
