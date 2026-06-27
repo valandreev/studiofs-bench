@@ -6,7 +6,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -14,7 +15,9 @@ use serde::Serialize;
 const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
 const DEFAULT_STREAMING_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FIXED_LAYOUT_FILES: usize = 100_000;
 const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
+static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Complete benchmark settings for one configured run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -171,10 +174,231 @@ pub enum RunMode {
 pub enum FileLayout {
     /// Store the workload in one file.
     SingleFile,
+    /// Split the workload into 100 files with slight deterministic size variance.
+    HundredFilesPlusMinusFive,
     /// Split the workload into files of this decimal MB size.
     ///
     /// The final file may be smaller when the workload is not evenly divisible.
     FixedFileSizeMb(u64),
+}
+
+/// Generated benchmark workload inside one temporary run directory.
+#[derive(Debug)]
+pub struct Workload {
+    run_dir: PathBuf,
+    files: Vec<WorkloadFile>,
+}
+
+impl Workload {
+    /// Creates workload files from a complete benchmark config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when config validation or filesystem I/O fails.
+    pub fn create(config: &BenchmarkConfig) -> Result<Self, WorkloadError> {
+        config.validate()?;
+        let total_bytes = config
+            .workload_size
+            .bytes()
+            .ok_or(ConfigError::WorkloadOverflow)?;
+        Self::create_for_bytes(&config.target_path, total_bytes, config.file_layout)
+    }
+
+    /// Creates workload files with an explicit byte size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when the size/layout combination is invalid or filesystem I/O
+    /// fails.
+    pub fn create_for_bytes(
+        target_path: impl AsRef<Path>,
+        total_bytes: u64,
+        file_layout: FileLayout,
+    ) -> Result<Self, WorkloadError> {
+        let target_path = target_path.as_ref();
+        let file_sizes = workload_file_sizes(total_bytes, file_layout)?;
+        let run_dir = create_unique_run_dir(target_path)?;
+        let max_file_size = file_sizes.iter().copied().max().unwrap_or(0);
+        let buffer = benchmark_buffer(max_file_size);
+        let files = write_workload_files(&run_dir, file_sizes, |path, bytes| {
+            write_workload_file(path, bytes, &buffer)
+        })?;
+
+        Ok(Self { run_dir, files })
+    }
+
+    /// Temporary benchmark run directory containing this workload.
+    #[must_use]
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// Files created for this workload.
+    #[must_use]
+    pub fn files(&self) -> &[WorkloadFile] {
+        &self.files
+    }
+
+    /// Total bytes across all created workload files.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.bytes).sum()
+    }
+
+    /// Removes only this workload's temporary run directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when removing the run directory fails.
+    pub fn cleanup(self) -> Result<(), WorkloadError> {
+        match std::fs::remove_dir_all(self.run_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// One generated benchmark workload file.
+#[derive(Debug)]
+pub struct WorkloadFile {
+    /// Workload file path.
+    pub path: PathBuf,
+    /// Workload file size in bytes.
+    pub bytes: u64,
+}
+
+fn workload_file_sizes(
+    total_bytes: u64,
+    file_layout: FileLayout,
+) -> Result<Vec<u64>, WorkloadError> {
+    if total_bytes == 0 {
+        return Err(ConfigError::ZeroWorkload.into());
+    }
+
+    match file_layout {
+        FileLayout::SingleFile => Ok(vec![total_bytes]),
+        FileLayout::HundredFilesPlusMinusFive => hundred_file_sizes(total_bytes),
+        FileLayout::FixedFileSizeMb(file_size_mb) => fixed_file_sizes(total_bytes, file_size_mb),
+    }
+}
+
+fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
+    const FILE_COUNT: usize = 100;
+    const WEIGHT_SUM: u64 = 9_995;
+
+    if total_bytes < FILE_COUNT as u64 {
+        return Err(WorkloadError::WorkloadTooSmallForLayout);
+    }
+
+    let mut sizes = vec![1; FILE_COUNT];
+    let weighted_bytes = total_bytes - FILE_COUNT as u64;
+    let mut allocated = 0_u64;
+    for (index, size_slot) in sizes.iter_mut().enumerate() {
+        let weight = 95 + index as u64 % 11;
+        let size =
+            (u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
+        allocated += size;
+        *size_slot += size;
+    }
+
+    let mut remainder = weighted_bytes - allocated;
+    for size in &mut sizes {
+        if remainder == 0 {
+            break;
+        }
+        *size += 1;
+        remainder -= 1;
+    }
+
+    Ok(sizes)
+}
+
+fn fixed_file_sizes(total_bytes: u64, file_size_mb: u64) -> Result<Vec<u64>, WorkloadError> {
+    if file_size_mb == 0 {
+        return Err(ConfigError::ZeroFileSize.into());
+    }
+
+    let Some(file_bytes) = file_size_mb.checked_mul(DECIMAL_MB) else {
+        return Err(ConfigError::WorkloadOverflow.into());
+    };
+    if file_bytes > total_bytes {
+        return Err(ConfigError::FileLayoutExceedsWorkload.into());
+    }
+
+    let capacity = usize::try_from(total_bytes.div_ceil(file_bytes))
+        .map_err(|_| ConfigError::WorkloadOverflow)?;
+    if capacity > MAX_FIXED_LAYOUT_FILES {
+        return Err(ConfigError::WorkloadOverflow.into());
+    }
+    let mut sizes = vec![file_bytes; capacity];
+    if let Some(last) = sizes.last_mut() {
+        let remainder = total_bytes % file_bytes;
+        if remainder != 0 {
+            *last = remainder;
+        }
+    }
+
+    Ok(sizes)
+}
+
+fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
+    if target_path.as_os_str().is_empty() {
+        return Err(ConfigError::EmptyTargetPath.into());
+    }
+
+    std::fs::create_dir_all(target_path)?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = RUN_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = target_path.join(format!(
+        "studiofs-bench-run-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+fn write_workload_files(
+    run_dir: &Path,
+    file_sizes: Vec<u64>,
+    mut write_file: impl FnMut(&Path, u64) -> Result<(), WorkloadError>,
+) -> Result<Vec<WorkloadFile>, WorkloadError> {
+    let mut files = Vec::with_capacity(file_sizes.len());
+
+    for (index, bytes) in file_sizes.into_iter().enumerate() {
+        let path = run_dir.join(format!("studiofs-bench-workload-{index:03}.bin"));
+        if let Err(error) = write_file(&path, bytes) {
+            let _ = std::fs::remove_dir_all(run_dir);
+            return Err(error);
+        }
+        files.push(WorkloadFile { path, bytes });
+    }
+
+    Ok(files)
+}
+
+fn benchmark_buffer(total_bytes: u64) -> Vec<u8> {
+    let buffer_size = usize::try_from(total_bytes)
+        .unwrap_or(DEFAULT_STREAMING_BLOCK_BYTES)
+        .min(DEFAULT_STREAMING_BLOCK_BYTES);
+    let mut buffer = vec![0_u8; buffer_size];
+    fill_benchmark_buffer(&mut buffer);
+    buffer
+}
+
+fn write_workload_file(path: &Path, file_size: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
+    let mut file = File::create(path)?;
+    let mut written = 0_u64;
+    while written < file_size {
+        let chunk = chunk_len(buffer.len(), file_size - written);
+        file.write_all(&buffer[..chunk])?;
+        written += chunk as u64;
+    }
+
+    Ok(())
 }
 
 /// Cache behavior expected for a benchmark run.
@@ -243,6 +467,51 @@ impl fmt::Display for ConfigError {
 }
 
 impl Error for ConfigError {}
+
+/// Workload generation error.
+#[derive(Debug)]
+pub enum WorkloadError {
+    /// Benchmark configuration is invalid for workload generation.
+    Config(ConfigError),
+    /// The requested total size cannot produce non-empty files for the layout.
+    WorkloadTooSmallForLayout,
+    /// Filesystem I/O failed.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for WorkloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => write!(f, "{error}"),
+            Self::WorkloadTooSmallForLayout => {
+                f.write_str("workload size is too small for the selected file layout")
+            }
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for WorkloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::WorkloadTooSmallForLayout => None,
+        }
+    }
+}
+
+impl From<ConfigError> for WorkloadError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<std::io::Error> for WorkloadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 
 /// Sequential streaming write/read engine.
 #[derive(Debug, Copy, Clone)]
@@ -658,6 +927,81 @@ mod tests {
         fill_benchmark_buffer(&mut buffer);
 
         assert_eq!(buffer, [117, 205, 37, 75, 132, 226, 234, 242]);
+    }
+
+    #[test]
+    fn hundred_file_sizes_keep_exact_total_for_large_workloads() {
+        let sizes = hundred_file_sizes(u64::MAX).unwrap();
+
+        assert_eq!(sizes.iter().sum::<u64>(), u64::MAX);
+    }
+
+    #[test]
+    fn hundred_file_sizes_keep_exact_total_near_minimum_size() {
+        let sizes = hundred_file_sizes(101).unwrap();
+
+        assert_eq!(sizes.iter().sum::<u64>(), 101);
+        assert!(sizes.iter().all(|size| *size > 0));
+    }
+
+    #[test]
+    fn fixed_file_sizes_rejects_too_many_files() {
+        let error = fixed_file_sizes(100_001 * DECIMAL_MB, 1).unwrap_err();
+
+        assert_eq!(error.to_string(), "workload size is too large");
+    }
+
+    #[test]
+    fn cleanup_ignores_missing_run_dir() {
+        let target = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target).unwrap();
+
+        let workload = Workload::create_for_bytes(&target, 1, FileLayout::SingleFile).unwrap();
+        let run_dir = workload.run_dir().to_owned();
+        std::fs::remove_dir_all(&run_dir).unwrap();
+
+        assert!(workload.cleanup().is_ok());
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn write_workload_files_removes_run_dir_when_file_write_fails() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run_dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let error = write_workload_files(&run_dir, vec![1, 2], |path, bytes| {
+            if bytes == 2 {
+                return Err(std::io::Error::other("write failed").into());
+            }
+            File::create(path)?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "write failed");
+        assert!(!run_dir.exists());
+    }
+
+    #[test]
+    fn write_workload_file_uses_supplied_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-572-buffer-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        write_workload_file(&path, 5, &[1, 2, 3]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
