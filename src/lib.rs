@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,12 +12,239 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::Serialize;
 use thiserror::Error;
 
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+};
+
 const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
 const DEFAULT_STREAMING_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FIXED_LAYOUT_FILES: usize = 100_000;
 const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
 static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Keyboard action understood by the terminal UI shell.
+#[derive(Debug)]
+pub enum UiAction {
+    /// Move selection to the previous setting.
+    MoveUp,
+    /// Move selection to the next setting.
+    MoveDown,
+    /// Select the previous value for the current setting.
+    PreviousValue,
+    /// Select the next value for the current setting.
+    NextValue,
+    /// Append a character to the target path field.
+    InsertText(char),
+    /// Remove one character from the target path field.
+    Backspace,
+    /// Start or stop the benchmark.
+    Submit,
+    /// Stop a running benchmark or exit when idle.
+    Cancel,
+}
+
+/// Full-screen terminal UI state for configuring a benchmark run.
+#[derive(Debug)]
+pub struct TerminalUi {
+    config: BenchmarkConfig,
+    selected: usize,
+    running: bool,
+    exit: bool,
+    message: String,
+}
+
+impl Default for TerminalUi {
+    fn default() -> Self {
+        Self {
+            config: BenchmarkConfig::for_target(PathBuf::from(".")),
+            selected: 0,
+            running: false,
+            exit: false,
+            message: String::from("Idle - Enter starts, Esc exits"),
+        }
+    }
+}
+
+impl TerminalUi {
+    /// Returns the currently selected benchmark config.
+    #[must_use]
+    pub fn config(&self) -> &BenchmarkConfig {
+        &self.config
+    }
+
+    /// Returns whether the UI has a running benchmark.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Returns whether the event loop should exit.
+    #[must_use]
+    pub fn should_exit(&self) -> bool {
+        self.exit
+    }
+
+    /// Applies one keyboard action to the UI state.
+    pub fn handle_action(&mut self, action: UiAction) {
+        if self.running && !matches!(action, UiAction::Submit | UiAction::Cancel) {
+            return;
+        }
+
+        match action {
+            UiAction::MoveUp => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            UiAction::MoveDown => {
+                self.selected = (self.selected + 1).min(SETTING_COUNT - 1);
+            }
+            UiAction::PreviousValue => self.change_selected(false),
+            UiAction::NextValue => self.change_selected(true),
+            UiAction::InsertText(value) if self.selected == TARGET_SETTING => {
+                let mut path = self.config.target_path.display().to_string();
+                path.push(value);
+                self.config.target_path = PathBuf::from(path);
+            }
+            UiAction::Backspace if self.selected == TARGET_SETTING => {
+                let mut path = self.config.target_path.display().to_string();
+                path.pop();
+                self.config.target_path = PathBuf::from(path);
+            }
+            UiAction::Submit => {
+                self.running = !self.running;
+                self.message = if self.running {
+                    String::from("Running - Enter/Esc stops")
+                } else {
+                    String::from("Stopping")
+                };
+            }
+            UiAction::Cancel if self.running => {
+                self.running = false;
+                self.message = String::from("Stopping");
+            }
+            UiAction::Cancel => {
+                self.exit = true;
+            }
+            UiAction::InsertText(_) | UiAction::Backspace => {}
+        }
+    }
+
+    /// Marks the current benchmark run as finished and displays its result.
+    pub fn finish_run(&mut self, message: impl Into<String>) {
+        self.running = false;
+        self.message = message.into();
+    }
+
+    /// Renders the full-screen terminal UI.
+    pub fn render(&self, frame: &mut Frame<'_>) {
+        let [header, settings, footer] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .areas(frame.area());
+
+        let title = Paragraph::new("studiofs-bench")
+            .block(Block::new().borders(Borders::BOTTOM))
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        frame.render_widget(title, header);
+
+        let rows = self
+            .setting_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, value))| {
+                let marker = if index == self.selected { "> " } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::raw(marker),
+                    Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(": ", Style::new().add_modifier(Modifier::BOLD)),
+                    Span::raw(value),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(rows).block(Block::new().title("Settings").borders(Borders::ALL)),
+            settings,
+        );
+
+        frame.render_widget(
+            Paragraph::new(self.message.as_str()).block(Block::new().borders(Borders::TOP)),
+            footer,
+        );
+    }
+
+    fn setting_rows(&self) -> [(&'static str, Cow<'static, str>); SETTING_COUNT] {
+        [
+            (
+                "Target path",
+                Cow::Owned(self.config.target_path.display().to_string()),
+            ),
+            (
+                "Workload size",
+                Cow::Borrowed(workload_size_label(self.config.workload_size)),
+            ),
+            (
+                "Mode",
+                Cow::Borrowed(test_mode_label(self.config.test_mode)),
+            ),
+            (
+                "Layout",
+                Cow::Borrowed(file_layout_label(self.config.file_layout)),
+            ),
+            (
+                "Cache mode",
+                Cow::Borrowed(cache_mode_label(self.config.cache_mode)),
+            ),
+            (
+                "Execution mode",
+                Cow::Borrowed(execution_mode_label(self.config.execution_mode)),
+            ),
+            (
+                "Keep files",
+                Cow::Borrowed(bool_label(self.config.keep_files)),
+            ),
+            (
+                "Save report",
+                Cow::Borrowed(bool_label(self.config.save_report)),
+            ),
+        ]
+    }
+
+    fn change_selected(&mut self, next: bool) {
+        match self.selected {
+            WORKLOAD_SETTING => {
+                self.config.workload_size = next_workload_size(self.config.workload_size, next)
+            }
+            MODE_SETTING => self.config.test_mode = next_test_mode(self.config.test_mode, next),
+            LAYOUT_SETTING => {
+                self.config.file_layout = next_file_layout(self.config.file_layout, next)
+            }
+            CACHE_SETTING => self.config.cache_mode = next_cache_mode(self.config.cache_mode),
+            EXECUTION_MODE_SETTING => {
+                self.config.execution_mode = next_execution_mode(self.config.execution_mode);
+            }
+            KEEP_FILES_SETTING => self.config.keep_files = !self.config.keep_files,
+            SAVE_REPORT_SETTING => self.config.save_report = !self.config.save_report,
+            TARGET_SETTING => {}
+            _ => {}
+        }
+    }
+}
+
+const TARGET_SETTING: usize = 0;
+const WORKLOAD_SETTING: usize = 1;
+const MODE_SETTING: usize = 2;
+const LAYOUT_SETTING: usize = 3;
+const CACHE_SETTING: usize = 4;
+const EXECUTION_MODE_SETTING: usize = 5;
+const KEEP_FILES_SETTING: usize = 6;
+const SAVE_REPORT_SETTING: usize = 7;
+const SETTING_COUNT: usize = 8;
 
 /// Complete benchmark settings for one configured run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -449,6 +677,102 @@ pub enum ExecutionMode {
     RunOnce,
     /// Continue executing until stopped by the caller.
     Continuous,
+}
+
+fn workload_size_label(value: WorkloadSize) -> &'static str {
+    match value {
+        WorkloadSize::Preset(WorkloadPreset::OneGb) => "1 GB",
+        WorkloadSize::Preset(WorkloadPreset::FourGb) => "4 GB",
+        WorkloadSize::Preset(WorkloadPreset::SixteenGb) => "16 GB",
+        WorkloadSize::Preset(WorkloadPreset::SixtyFourGb) => "64 GB",
+        WorkloadSize::CustomGb(_) => "custom",
+    }
+}
+
+fn next_workload_size(value: WorkloadSize, next: bool) -> WorkloadSize {
+    const VALUES: [WorkloadSize; 4] = [
+        WorkloadSize::Preset(WorkloadPreset::OneGb),
+        WorkloadSize::Preset(WorkloadPreset::FourGb),
+        WorkloadSize::Preset(WorkloadPreset::SixteenGb),
+        WorkloadSize::Preset(WorkloadPreset::SixtyFourGb),
+    ];
+    cycle(value, &VALUES, next)
+}
+
+fn test_mode_label(value: DiskTestMode) -> &'static str {
+    match value {
+        DiskTestMode::ReadWrite => "read/write",
+        DiskTestMode::WriteOnly => "write only",
+        DiskTestMode::WriteOnceReadLoop => "write once, read loop",
+    }
+}
+
+fn next_test_mode(value: DiskTestMode, next: bool) -> DiskTestMode {
+    const VALUES: [DiskTestMode; 3] = [
+        DiskTestMode::ReadWrite,
+        DiskTestMode::WriteOnly,
+        DiskTestMode::WriteOnceReadLoop,
+    ];
+    cycle(value, &VALUES, next)
+}
+
+fn file_layout_label(value: FileLayout) -> &'static str {
+    match value {
+        FileLayout::SingleFile => "single file",
+        FileLayout::HundredFilesPlusMinusFive => "100 files +/-5%",
+        FileLayout::FixedFileSizeMb(_) => "fixed file size",
+    }
+}
+
+fn next_file_layout(value: FileLayout, next: bool) -> FileLayout {
+    const VALUES: [FileLayout; 2] = [
+        FileLayout::SingleFile,
+        FileLayout::HundredFilesPlusMinusFive,
+    ];
+    cycle(value, &VALUES, next)
+}
+
+fn cache_mode_label(value: CacheMode) -> &'static str {
+    match value {
+        CacheMode::Enabled => "enabled",
+        CacheMode::Disabled => "disabled",
+    }
+}
+
+fn next_cache_mode(value: CacheMode) -> CacheMode {
+    match value {
+        CacheMode::Enabled => CacheMode::Disabled,
+        CacheMode::Disabled => CacheMode::Enabled,
+    }
+}
+
+fn execution_mode_label(value: ExecutionMode) -> &'static str {
+    match value {
+        ExecutionMode::RunOnce => "run once",
+        ExecutionMode::Continuous => "continuous",
+    }
+}
+
+fn next_execution_mode(value: ExecutionMode) -> ExecutionMode {
+    match value {
+        ExecutionMode::RunOnce => ExecutionMode::Continuous,
+        ExecutionMode::Continuous => ExecutionMode::RunOnce,
+    }
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn cycle<T: Copy + PartialEq>(value: T, values: &[T], next: bool) -> T {
+    assert!(!values.is_empty(), "cannot cycle through an empty slice");
+    let index = values.iter().position(|item| *item == value).unwrap_or(0);
+    let index = if next {
+        (index + 1) % values.len()
+    } else {
+        (index + values.len() - 1) % values.len()
+    };
+    values[index]
 }
 
 /// User-facing configuration validation error.
