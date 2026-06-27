@@ -28,6 +28,8 @@ pub struct BenchmarkConfig {
     pub workload_size: WorkloadSize,
     /// Filesystem access mode under test.
     pub run_mode: RunMode,
+    /// Disk test mode executed by the runner.
+    pub test_mode: DiskTestMode,
     /// Layout used for benchmark files.
     pub file_layout: FileLayout,
     /// Cache behavior expected for the run.
@@ -51,6 +53,7 @@ impl BenchmarkConfig {
             target_path,
             workload_size: WorkloadSize::Preset(WorkloadPreset::FourGb),
             run_mode: RunMode::LocalFilesystem,
+            test_mode: DiskTestMode::ReadWrite,
             file_layout: FileLayout::SingleFile,
             cache_mode: CacheMode::Enabled,
             keep_files: false,
@@ -166,6 +169,18 @@ pub enum RunMode {
     LocalFilesystem,
     /// Benchmark a mounted filesystem path.
     MountedFilesystem,
+}
+
+/// Disk test mode executed by the benchmark runner.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskTestMode {
+    /// Write the workload, then read it back.
+    ReadWrite,
+    /// Write the workload without a read pass.
+    WriteOnly,
+    /// Write once, then keep repeating read passes until stopped.
+    WriteOnceReadLoop,
 }
 
 /// File layout used for generated benchmark data.
@@ -513,6 +528,297 @@ impl From<std::io::Error> for WorkloadError {
     }
 }
 
+/// Runs benchmark workloads according to [`BenchmarkConfig`].
+#[derive(Debug, Copy, Clone, Default)]
+pub struct BenchmarkRunner {
+    engine: StreamingIoEngine,
+}
+
+impl BenchmarkRunner {
+    /// Creates a runner with a custom streaming block size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::ZeroBlockSize`] when `block_size` is zero.
+    pub fn with_block_size(block_size: usize) -> Result<Self, StreamingIoError> {
+        Ok(Self {
+            engine: StreamingIoEngine::with_block_size(block_size)?,
+        })
+    }
+
+    /// Creates and runs a workload from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BenchmarkRunnerError`] when config validation, workload creation, or benchmark
+    /// I/O fails.
+    pub fn run(
+        self,
+        config: &BenchmarkConfig,
+        on_sample: impl FnMut(StreamingIoSample),
+        should_stop: impl FnMut() -> bool,
+    ) -> Result<BenchmarkRunnerReport, BenchmarkRunnerError> {
+        let workload = Workload::create(config)?;
+        self.run_workload(workload, config, on_sample, should_stop)
+    }
+
+    /// Runs an existing workload.
+    ///
+    /// This is useful for tests and for callers that need to prepare the run directory before the
+    /// timed benchmark passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BenchmarkRunnerError`] when config validation or benchmark I/O fails.
+    pub fn run_workload(
+        self,
+        workload: Workload,
+        config: &BenchmarkConfig,
+        mut on_sample: impl FnMut(StreamingIoSample),
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Result<BenchmarkRunnerReport, BenchmarkRunnerError> {
+        config.validate()?;
+        let run_dir = workload.run_dir().to_owned();
+        let files = workload
+            .files()
+            .iter()
+            .map(|file| (file.path.clone(), file.bytes))
+            .collect::<Vec<_>>();
+        let mut report = BenchmarkRunnerReport {
+            run_dir,
+            files_kept: config.keep_files,
+            cleanup_error: None,
+            passes: Vec::new(),
+            stopped: false,
+        };
+
+        let run_result = self.run_passes(
+            &files,
+            config,
+            &mut report,
+            &mut on_sample,
+            &mut should_stop,
+        );
+
+        if !config.keep_files
+            && let Err(error) = workload.cleanup()
+        {
+            report.cleanup_error = Some(error.to_string());
+        }
+
+        run_result?;
+        Ok(report)
+    }
+
+    fn run_passes(
+        self,
+        files: &[(PathBuf, u64)],
+        config: &BenchmarkConfig,
+        report: &mut BenchmarkRunnerReport,
+        on_sample: &mut impl FnMut(StreamingIoSample),
+        should_stop: &mut impl FnMut() -> bool,
+    ) -> Result<(), BenchmarkRunnerError> {
+        match config.test_mode {
+            DiskTestMode::ReadWrite => self.run_phase_loop(
+                files,
+                &[StreamingIoPhase::Write, StreamingIoPhase::Read],
+                config,
+                report,
+                on_sample,
+                should_stop,
+            )?,
+            DiskTestMode::WriteOnly => self.run_phase_loop(
+                files,
+                &[StreamingIoPhase::Write],
+                config,
+                report,
+                on_sample,
+                should_stop,
+            )?,
+            DiskTestMode::WriteOnceReadLoop => {
+                let write_pass = self.run_files(
+                    files,
+                    StreamingIoPhase::Write,
+                    1,
+                    config,
+                    on_sample,
+                    should_stop,
+                )?;
+                report.stopped |= write_pass.stopped;
+                report.passes.push(write_pass);
+
+                if !report.stopped {
+                    self.run_phase_loop(
+                        files,
+                        &[StreamingIoPhase::Read],
+                        config,
+                        report,
+                        on_sample,
+                        should_stop,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_phase_loop(
+        self,
+        files: &[(PathBuf, u64)],
+        phases: &[StreamingIoPhase],
+        config: &BenchmarkConfig,
+        report: &mut BenchmarkRunnerReport,
+        on_sample: &mut impl FnMut(StreamingIoSample),
+        should_stop: &mut impl FnMut() -> bool,
+    ) -> Result<(), BenchmarkRunnerError> {
+        let mut pass_number = 1;
+        loop {
+            for phase in phases {
+                let pass =
+                    self.run_files(files, *phase, pass_number, config, on_sample, should_stop)?;
+                report.stopped |= pass.stopped;
+                report.passes.push(pass);
+                if report.stopped {
+                    break;
+                }
+            }
+
+            if config.execution_mode == ExecutionMode::RunOnce || report.stopped || should_stop() {
+                break;
+            }
+            pass_number += 1;
+        }
+
+        Ok(())
+    }
+
+    fn run_files(
+        self,
+        files: &[(PathBuf, u64)],
+        phase: StreamingIoPhase,
+        pass_number: u64,
+        config: &BenchmarkConfig,
+        on_sample: &mut impl FnMut(StreamingIoSample),
+        should_stop: &mut impl FnMut() -> bool,
+    ) -> Result<BenchmarkPassReport, BenchmarkRunnerError> {
+        let mut bytes_processed = 0;
+        let mut stopped = false;
+        for (path, bytes) in files {
+            let report = match phase {
+                StreamingIoPhase::Write => self.engine.write_with_cache_mode(
+                    path,
+                    *bytes,
+                    config.cache_mode,
+                    pass_number,
+                    &mut *on_sample,
+                    &mut *should_stop,
+                )?,
+                StreamingIoPhase::Read => self.engine.read_with_cache_mode(
+                    path,
+                    *bytes,
+                    config.cache_mode,
+                    pass_number,
+                    &mut *on_sample,
+                    &mut *should_stop,
+                )?,
+            };
+            bytes_processed += match phase {
+                StreamingIoPhase::Write => report.bytes_written,
+                StreamingIoPhase::Read => report.bytes_read,
+            };
+            stopped = report.stopped;
+            if stopped {
+                break;
+            }
+        }
+
+        Ok(BenchmarkPassReport {
+            phase,
+            pass_number,
+            bytes_processed,
+            stopped,
+        })
+    }
+}
+
+/// Summary returned by the benchmark runner.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkRunnerReport {
+    /// Benchmark-created run directory.
+    pub run_dir: PathBuf,
+    /// Whether generated files were kept after the run.
+    pub files_kept: bool,
+    /// Cleanup error text, if cleanup failed after benchmark results were collected.
+    pub cleanup_error: Option<String>,
+    /// Reports for completed phase passes.
+    pub passes: Vec<BenchmarkPassReport>,
+    /// Whether the caller stopped the run before a phase completed.
+    pub stopped: bool,
+}
+
+/// Summary for one benchmark runner phase pass.
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct BenchmarkPassReport {
+    /// Phase executed by this pass.
+    pub phase: StreamingIoPhase,
+    /// One-based pass number for this phase.
+    pub pass_number: u64,
+    /// Bytes processed across workload files.
+    pub bytes_processed: u64,
+    /// Whether the phase stopped before all files completed.
+    pub stopped: bool,
+}
+
+/// Benchmark runner error.
+#[derive(Debug)]
+pub enum BenchmarkRunnerError {
+    /// Benchmark configuration is invalid.
+    Config(ConfigError),
+    /// Workload generation failed.
+    Workload(WorkloadError),
+    /// Streaming I/O failed.
+    StreamingIo(StreamingIoError),
+}
+
+impl fmt::Display for BenchmarkRunnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => write!(f, "{error}"),
+            Self::Workload(error) => write!(f, "{error}"),
+            Self::StreamingIo(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for BenchmarkRunnerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Workload(error) => Some(error),
+            Self::StreamingIo(error) => Some(error),
+        }
+    }
+}
+
+impl From<ConfigError> for BenchmarkRunnerError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<WorkloadError> for BenchmarkRunnerError {
+    fn from(error: WorkloadError) -> Self {
+        Self::Workload(error)
+    }
+}
+
+impl From<StreamingIoError> for BenchmarkRunnerError {
+    fn from(error: StreamingIoError) -> Self {
+        Self::StreamingIo(error)
+    }
+}
+
 /// Sequential streaming write/read engine.
 #[derive(Debug, Copy, Clone)]
 pub struct StreamingIoEngine {
@@ -581,6 +887,49 @@ impl StreamingIoEngine {
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
+        let mut report = self.write_with_cache_mode(
+            path,
+            total_bytes,
+            cache_mode,
+            1,
+            &mut on_sample,
+            &mut should_stop,
+        )?;
+
+        if report.bytes_written < total_bytes {
+            report.stopped = true;
+            return Ok(report);
+        }
+
+        let read_report = self.read_with_cache_mode(
+            path,
+            total_bytes,
+            cache_mode,
+            1,
+            &mut on_sample,
+            &mut should_stop,
+        )?;
+        report.bytes_read = read_report.bytes_read;
+        report.stopped = read_report.stopped;
+
+        Ok(report)
+    }
+
+    /// Runs one sequential write pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::Io`] when creating, writing, or syncing the file fails.
+    pub fn write_with_cache_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        total_bytes: u64,
+        cache_mode: CacheMode,
+        pass_number: u64,
+        mut on_sample: impl FnMut(StreamingIoSample),
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Result<StreamingIoReport, StreamingIoError> {
+        let path = path.as_ref();
         let buffer_size = usize::try_from(total_bytes)
             .unwrap_or(self.block_size)
             .min(self.block_size);
@@ -599,23 +948,50 @@ impl StreamingIoEngine {
             &mut output,
             &mut buffer,
             total_bytes,
+            pass_number,
             &mut on_sample,
             &mut should_stop,
         )?;
 
-        if report.bytes_written < total_bytes {
-            report.stopped = true;
-            return Ok(report);
-        }
-
         after_cache_io(&output, cache_mode);
-        drop(output);
+        report.stopped = report.bytes_written < total_bytes;
+
+        Ok(report)
+    }
+
+    /// Runs one sequential read pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamingIoError::Io`] when opening or reading the file fails.
+    pub fn read_with_cache_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        total_bytes: u64,
+        cache_mode: CacheMode,
+        pass_number: u64,
+        mut on_sample: impl FnMut(StreamingIoSample),
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Result<StreamingIoReport, StreamingIoError> {
+        let path = path.as_ref();
+        let buffer_size = usize::try_from(total_bytes)
+            .unwrap_or(self.block_size)
+            .min(self.block_size);
+        let mut buffer = vec![0_u8; buffer_size];
+        let mut report = StreamingIoReport::default();
+
+        report.metadata.cache_mode = cache_mode;
+        report.metadata.cache_method = match cache_mode {
+            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
+            CacheMode::Disabled => disabled_cache_method(),
+        };
 
         let mut input = open_file(path, cache_mode)?;
         report.bytes_read = stream_read(
             &mut input,
             &mut buffer,
             total_bytes,
+            pass_number,
             &mut on_sample,
             &mut should_stop,
         )?;
@@ -710,6 +1086,7 @@ fn stream_write(
     output: &mut File,
     buffer: &mut [u8],
     total_bytes: u64,
+    pass_number: u64,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
@@ -734,6 +1111,7 @@ fn stream_write(
         processed += chunk as u64;
         on_sample(sample(
             StreamingIoPhase::Write,
+            pass_number,
             offset,
             processed,
             elapsed_io,
@@ -747,6 +1125,7 @@ fn stream_read(
     input: &mut File,
     buffer: &mut [u8],
     total_bytes: u64,
+    pass_number: u64,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
@@ -766,6 +1145,7 @@ fn stream_read(
         processed += chunk as u64;
         on_sample(sample(
             StreamingIoPhase::Read,
+            pass_number,
             offset,
             processed,
             elapsed_io,
@@ -796,6 +1176,7 @@ fn fill_benchmark_buffer(buffer: &mut [u8]) {
 )]
 fn sample(
     phase: StreamingIoPhase,
+    pass_number: u64,
     offset: u64,
     bytes_processed: u64,
     elapsed_io: Duration,
@@ -804,7 +1185,7 @@ fn sample(
 
     StreamingIoSample {
         phase,
-        pass_number: 1,
+        pass_number,
         timestamp: SystemTime::now(),
         offset,
         bytes_processed,

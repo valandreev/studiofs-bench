@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use studiofs_bench::{
-    BenchmarkConfig, CacheMode, ConfigError, ExecutionMode, FileLayout, RunMode, Workload,
-    WorkloadPreset, WorkloadSize,
+    BenchmarkConfig, CacheMode, ConfigError, DiskTestMode, ExecutionMode, FileLayout, RunMode,
+    Workload, WorkloadPreset, WorkloadSize,
 };
 
 #[test]
@@ -15,6 +15,7 @@ fn default_config_uses_documented_benchmark_contract() {
     assert_eq!(config.workload_size.gigabytes(), 4);
     assert_eq!(config.workload_size.megabytes(), Some(4_000));
     assert_eq!(config.run_mode, RunMode::LocalFilesystem);
+    assert_eq!(config.test_mode, DiskTestMode::ReadWrite);
     assert_eq!(config.file_layout, FileLayout::SingleFile);
     assert_eq!(config.cache_mode, CacheMode::Enabled);
     assert!(!config.keep_files);
@@ -82,6 +83,7 @@ fn config_serializes_report_ready_values() {
     let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
     config.workload_size = WorkloadSize::CustomGb(16);
     config.run_mode = RunMode::MountedFilesystem;
+    config.test_mode = DiskTestMode::WriteOnceReadLoop;
     config.cache_mode = CacheMode::Disabled;
     config.keep_files = true;
     config.save_report = false;
@@ -91,6 +93,7 @@ fn config_serializes_report_ready_values() {
 
     assert_eq!(value["workload_size"]["custom_gb"], 16);
     assert_eq!(value["run_mode"], "mounted_filesystem");
+    assert_eq!(value["test_mode"], "write_once_read_loop");
     assert_eq!(value["file_layout"], "single_file");
     assert_eq!(value["cache_mode"], "disabled");
     assert_eq!(value["keep_files"], true);
