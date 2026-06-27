@@ -118,6 +118,24 @@ fn engine_records_disabled_cache_method_in_report_metadata() {
 }
 
 #[test]
+fn engine_skips_zero_byte_read_without_opening_file() {
+    let dir = TestDir::new("studiofs-bench-sfs-573-zero-read");
+    let path = dir.path().join("missing.bin");
+
+    let report = StreamingIoEngine::with_block_size(4)
+        .unwrap()
+        .read_with_cache_mode(&path, 0, CacheMode::Disabled, 7, |_| {}, || false)
+        .unwrap();
+
+    assert_eq!(report.bytes_read, 0);
+    assert!(!report.stopped);
+    assert_eq!(
+        (report.metadata.cache_mode, report.metadata.cache_method),
+        (CacheMode::Disabled, expected_disabled_cache_method())
+    );
+}
+
+#[test]
 fn engine_stamps_offsets_inside_large_chunks() {
     let dir = TestDir::new("studiofs-bench-sfs-571-sub-block-stamps");
     let path = dir.path().join("stream.bin");

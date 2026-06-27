@@ -2,8 +2,6 @@
 
 #![deny(missing_docs)]
 
-use std::error::Error;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
+use thiserror::Error;
 
 const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
@@ -453,79 +452,37 @@ pub enum ExecutionMode {
 }
 
 /// User-facing configuration validation error.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Error, PartialEq, Eq)]
 pub enum ConfigError {
     /// The target path is empty.
+    #[error("target path must not be empty")]
     EmptyTargetPath,
     /// The workload size is zero.
+    #[error("workload size must be greater than zero")]
     ZeroWorkload,
     /// The fixed file size is zero.
+    #[error("file layout size must be greater than zero")]
     ZeroFileSize,
     /// The fixed file size is larger than the total workload.
+    #[error("file layout size must not exceed total workload size")]
     FileLayoutExceedsWorkload,
     /// The workload size is too large for decimal byte representation.
+    #[error("workload size is too large")]
     WorkloadOverflow,
 }
 
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyTargetPath => f.write_str("target path must not be empty"),
-            Self::ZeroWorkload => f.write_str("workload size must be greater than zero"),
-            Self::ZeroFileSize => f.write_str("file layout size must be greater than zero"),
-            Self::FileLayoutExceedsWorkload => {
-                f.write_str("file layout size must not exceed total workload size")
-            }
-            Self::WorkloadOverflow => f.write_str("workload size is too large"),
-        }
-    }
-}
-
-impl Error for ConfigError {}
-
 /// Workload generation error.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum WorkloadError {
     /// Benchmark configuration is invalid for workload generation.
-    Config(ConfigError),
+    #[error("{0}")]
+    Config(#[from] ConfigError),
     /// The requested total size cannot produce non-empty files for the layout.
+    #[error("workload size is too small for the selected file layout")]
     WorkloadTooSmallForLayout,
     /// Filesystem I/O failed.
-    Io(std::io::Error),
-}
-
-impl fmt::Display for WorkloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "{error}"),
-            Self::WorkloadTooSmallForLayout => {
-                f.write_str("workload size is too small for the selected file layout")
-            }
-            Self::Io(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl Error for WorkloadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Config(error) => Some(error),
-            Self::Io(error) => Some(error),
-            Self::WorkloadTooSmallForLayout => None,
-        }
-    }
-}
-
-impl From<ConfigError> for WorkloadError {
-    fn from(error: ConfigError) -> Self {
-        Self::Config(error)
-    }
-}
-
-impl From<std::io::Error> for WorkloadError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Runs benchmark workloads according to [`BenchmarkConfig`].
@@ -579,11 +536,6 @@ impl BenchmarkRunner {
     ) -> Result<BenchmarkRunnerReport, BenchmarkRunnerError> {
         config.validate()?;
         let run_dir = workload.run_dir().to_owned();
-        let files = workload
-            .files()
-            .iter()
-            .map(|file| (file.path.clone(), file.bytes))
-            .collect::<Vec<_>>();
         let mut report = BenchmarkRunnerReport {
             run_dir,
             files_kept: config.keep_files,
@@ -593,7 +545,7 @@ impl BenchmarkRunner {
         };
 
         let run_result = self.run_passes(
-            &files,
+            workload.files(),
             config,
             &mut report,
             &mut on_sample,
@@ -612,7 +564,7 @@ impl BenchmarkRunner {
 
     fn run_passes(
         self,
-        files: &[(PathBuf, u64)],
+        files: &[WorkloadFile],
         config: &BenchmarkConfig,
         report: &mut BenchmarkRunnerReport,
         on_sample: &mut impl FnMut(StreamingIoSample),
@@ -665,7 +617,7 @@ impl BenchmarkRunner {
 
     fn run_phase_loop(
         self,
-        files: &[(PathBuf, u64)],
+        files: &[WorkloadFile],
         phases: &[StreamingIoPhase],
         config: &BenchmarkConfig,
         report: &mut BenchmarkRunnerReport,
@@ -695,7 +647,7 @@ impl BenchmarkRunner {
 
     fn run_files(
         self,
-        files: &[(PathBuf, u64)],
+        files: &[WorkloadFile],
         phase: StreamingIoPhase,
         pass_number: u64,
         config: &BenchmarkConfig,
@@ -704,21 +656,38 @@ impl BenchmarkRunner {
     ) -> Result<BenchmarkPassReport, BenchmarkRunnerError> {
         let mut bytes_processed = 0;
         let mut stopped = false;
-        for (path, bytes) in files {
+        let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
+        let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
+        if phase == StreamingIoPhase::Write {
+            fill_benchmark_buffer(&mut buffer);
+        }
+
+        for file in files {
+            if should_stop() {
+                stopped = true;
+                break;
+            }
+
             let report = match phase {
-                StreamingIoPhase::Write => self.engine.write_with_cache_mode(
-                    path,
-                    *bytes,
-                    config.cache_mode,
-                    pass_number,
+                StreamingIoPhase::Write => self.engine.write_with_buffer(
+                    StreamingIoPass {
+                        path: &file.path,
+                        total_bytes: file.bytes,
+                        cache_mode: config.cache_mode,
+                        pass_number,
+                    },
+                    &mut buffer,
                     &mut *on_sample,
                     &mut *should_stop,
                 )?,
-                StreamingIoPhase::Read => self.engine.read_with_cache_mode(
-                    path,
-                    *bytes,
-                    config.cache_mode,
-                    pass_number,
+                StreamingIoPhase::Read => self.engine.read_with_buffer(
+                    StreamingIoPass {
+                        path: &file.path,
+                        total_bytes: file.bytes,
+                        cache_mode: config.cache_mode,
+                        pass_number,
+                    },
+                    &mut buffer,
                     &mut *on_sample,
                     &mut *should_stop,
                 )?,
@@ -762,7 +731,7 @@ pub struct BenchmarkRunnerReport {
 pub struct BenchmarkPassReport {
     /// Phase executed by this pass.
     pub phase: StreamingIoPhase,
-    /// One-based pass number for this phase.
+    /// One-based pass number within this phase.
     pub pass_number: u64,
     /// Bytes processed across workload files.
     pub bytes_processed: u64,
@@ -771,52 +740,17 @@ pub struct BenchmarkPassReport {
 }
 
 /// Benchmark runner error.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum BenchmarkRunnerError {
     /// Benchmark configuration is invalid.
-    Config(ConfigError),
+    #[error("{0}")]
+    Config(#[from] ConfigError),
     /// Workload generation failed.
-    Workload(WorkloadError),
+    #[error("{0}")]
+    Workload(#[from] WorkloadError),
     /// Streaming I/O failed.
-    StreamingIo(StreamingIoError),
-}
-
-impl fmt::Display for BenchmarkRunnerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "{error}"),
-            Self::Workload(error) => write!(f, "{error}"),
-            Self::StreamingIo(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl Error for BenchmarkRunnerError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Config(error) => Some(error),
-            Self::Workload(error) => Some(error),
-            Self::StreamingIo(error) => Some(error),
-        }
-    }
-}
-
-impl From<ConfigError> for BenchmarkRunnerError {
-    fn from(error: ConfigError) -> Self {
-        Self::Config(error)
-    }
-}
-
-impl From<WorkloadError> for BenchmarkRunnerError {
-    fn from(error: WorkloadError) -> Self {
-        Self::Workload(error)
-    }
-}
-
-impl From<StreamingIoError> for BenchmarkRunnerError {
-    fn from(error: StreamingIoError) -> Self {
-        Self::StreamingIo(error)
-    }
+    #[error("{0}")]
+    StreamingIo(#[from] StreamingIoError),
 }
 
 /// Sequential streaming write/read engine.
@@ -930,31 +864,45 @@ impl StreamingIoEngine {
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
-        let buffer_size = usize::try_from(total_bytes)
-            .unwrap_or(self.block_size)
-            .min(self.block_size);
-        let mut buffer = vec![0_u8; buffer_size];
+        let mut buffer = self.buffer_for_bytes(total_bytes);
         fill_benchmark_buffer(&mut buffer);
-        let mut report = StreamingIoReport::default();
-
-        report.metadata.cache_mode = cache_mode;
-        report.metadata.cache_method = match cache_mode {
-            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
-            CacheMode::Disabled => disabled_cache_method(),
-        };
-
-        let mut output = create_file(path, cache_mode)?;
-        report.bytes_written = stream_write(
-            &mut output,
+        self.write_with_buffer(
+            StreamingIoPass {
+                path,
+                total_bytes,
+                cache_mode,
+                pass_number,
+            },
             &mut buffer,
-            total_bytes,
-            pass_number,
             &mut on_sample,
             &mut should_stop,
+        )
+    }
+
+    fn write_with_buffer(
+        self,
+        pass: StreamingIoPass<'_>,
+        buffer: &mut [u8],
+        on_sample: &mut impl FnMut(StreamingIoSample),
+        should_stop: &mut impl FnMut() -> bool,
+    ) -> Result<StreamingIoReport, StreamingIoError> {
+        if pass.total_bytes == 0 {
+            return Ok(empty_streaming_report(pass.cache_mode));
+        }
+        let mut report = empty_streaming_report(pass.cache_mode);
+
+        let mut output = create_file(pass.path, pass.cache_mode)?;
+        report.bytes_written = stream_write(
+            &mut output,
+            buffer,
+            pass.total_bytes,
+            pass.pass_number,
+            on_sample,
+            should_stop,
         )?;
 
-        after_cache_io(&output, cache_mode);
-        report.stopped = report.bytes_written < total_bytes;
+        after_cache_io(&output, pass.cache_mode);
+        report.stopped = report.bytes_written < pass.total_bytes;
 
         Ok(report)
     }
@@ -974,32 +922,71 @@ impl StreamingIoEngine {
         mut should_stop: impl FnMut() -> bool,
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
-        let buffer_size = usize::try_from(total_bytes)
-            .unwrap_or(self.block_size)
-            .min(self.block_size);
-        let mut buffer = vec![0_u8; buffer_size];
-        let mut report = StreamingIoReport::default();
-
-        report.metadata.cache_mode = cache_mode;
-        report.metadata.cache_method = match cache_mode {
-            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
-            CacheMode::Disabled => disabled_cache_method(),
-        };
-
-        let mut input = open_file(path, cache_mode)?;
-        report.bytes_read = stream_read(
-            &mut input,
+        let mut buffer = self.buffer_for_bytes(total_bytes);
+        self.read_with_buffer(
+            StreamingIoPass {
+                path,
+                total_bytes,
+                cache_mode,
+                pass_number,
+            },
             &mut buffer,
-            total_bytes,
-            pass_number,
             &mut on_sample,
             &mut should_stop,
+        )
+    }
+
+    fn read_with_buffer(
+        self,
+        pass: StreamingIoPass<'_>,
+        buffer: &mut [u8],
+        on_sample: &mut impl FnMut(StreamingIoSample),
+        should_stop: &mut impl FnMut() -> bool,
+    ) -> Result<StreamingIoReport, StreamingIoError> {
+        if pass.total_bytes == 0 {
+            return Ok(empty_streaming_report(pass.cache_mode));
+        }
+        let mut report = empty_streaming_report(pass.cache_mode);
+
+        let mut input = open_file(pass.path, pass.cache_mode)?;
+        report.bytes_read = stream_read(
+            &mut input,
+            buffer,
+            pass.total_bytes,
+            pass.pass_number,
+            on_sample,
+            should_stop,
         )?;
-        after_cache_io(&input, cache_mode);
-        report.stopped = report.bytes_read < total_bytes;
+        after_cache_io(&input, pass.cache_mode);
+        report.stopped = report.bytes_read < pass.total_bytes;
 
         Ok(report)
     }
+
+    fn buffer_for_bytes(self, total_bytes: u64) -> Vec<u8> {
+        let buffer_size = usize::try_from(total_bytes)
+            .unwrap_or(self.block_size)
+            .min(self.block_size);
+        vec![0_u8; buffer_size]
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct StreamingIoPass<'a> {
+    path: &'a std::path::Path,
+    total_bytes: u64,
+    cache_mode: CacheMode,
+    pass_number: u64,
+}
+
+fn empty_streaming_report(cache_mode: CacheMode) -> StreamingIoReport {
+    let mut report = StreamingIoReport::default();
+    report.metadata.cache_mode = cache_mode;
+    report.metadata.cache_method = match cache_mode {
+        CacheMode::Enabled => CacheControlMethod::NormalFileIo,
+        CacheMode::Disabled => disabled_cache_method(),
+    };
+    report
 }
 
 fn create_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
@@ -1208,7 +1195,7 @@ pub enum StreamingIoPhase {
 pub struct StreamingIoSample {
     /// Phase that emitted the sample.
     pub phase: StreamingIoPhase,
-    /// One-based pass number.
+    /// One-based pass number within this phase.
     pub pass_number: u64,
     /// Wall-clock timestamp when the sample was emitted.
     pub timestamp: SystemTime,
@@ -1260,36 +1247,14 @@ impl Default for StreamingIoReportMetadata {
 }
 
 /// Sequential streaming engine error.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum StreamingIoError {
     /// Block size must be non-zero.
+    #[error("streaming block size must be greater than zero")]
     ZeroBlockSize,
     /// Filesystem I/O failed.
-    Io(std::io::Error),
-}
-
-impl fmt::Display for StreamingIoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroBlockSize => f.write_str("streaming block size must be greater than zero"),
-            Self::Io(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl Error for StreamingIoError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::ZeroBlockSize => None,
-            Self::Io(error) => Some(error),
-        }
-    }
-}
-
-impl From<std::io::Error> for StreamingIoError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[cfg(test)]
