@@ -117,6 +117,22 @@ fn engine_records_disabled_cache_method_in_report_metadata() {
     );
 }
 
+#[test]
+fn engine_stamps_offsets_inside_large_chunks() {
+    let dir = TestDir::new("studiofs-bench-sfs-571-sub-block-stamps");
+    let path = dir.path().join("stream.bin");
+
+    let engine = StreamingIoEngine::with_block_size(8192).unwrap();
+
+    engine.run(&path, 8192, |_| {}, || false).unwrap();
+
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(
+        (&bytes[..8], &bytes[4096..4104]),
+        (&0_u64.to_le_bytes()[..], &4096_u64.to_le_bytes()[..])
+    );
+}
+
 #[cfg(windows)]
 fn expected_disabled_cache_method() -> CacheControlMethod {
     CacheControlMethod::WriteThrough

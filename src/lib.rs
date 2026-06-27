@@ -14,6 +14,7 @@ use serde::Serialize;
 const DECIMAL_MB: u64 = 1_000_000;
 const MB_PER_GB: u64 = 1_000;
 const DEFAULT_STREAMING_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
 
 /// Complete benchmark settings for one configured run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -583,9 +584,11 @@ pub struct StreamingIoReport {
 }
 
 fn stamp_block_offset(chunk: &mut [u8], offset: u64) {
-    let stamp = offset.to_le_bytes();
-    let stamp_len = chunk.len().min(stamp.len());
-    chunk[..stamp_len].copy_from_slice(&stamp[..stamp_len]);
+    for stamp_offset in (0..chunk.len()).step_by(STAMP_INTERVAL_BYTES) {
+        let stamp = (offset + stamp_offset as u64).to_le_bytes();
+        let stamp_end = (stamp_offset + stamp.len()).min(chunk.len());
+        chunk[stamp_offset..stamp_end].copy_from_slice(&stamp[..stamp_end - stamp_offset]);
+    }
 }
 
 /// Metadata describing selected benchmark run behavior.

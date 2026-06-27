@@ -16,8 +16,10 @@ dbg_macro = "warn"
 todo = "warn"
 
 [dependencies]
-libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = "1"
