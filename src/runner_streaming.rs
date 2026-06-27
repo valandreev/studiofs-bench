@@ -185,6 +185,7 @@ impl BenchmarkRunner {
         let mut bytes_processed = 0;
         let mut stopped = false;
         let mut metrics = MetricsAccumulator::default();
+        let mut throughput_samples = Vec::new();
         let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
         let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
         if phase == StreamingIoPhase::Write {
@@ -202,6 +203,7 @@ impl BenchmarkRunner {
                     sample.offset += bytes_processed;
                     sample.bytes_processed += bytes_processed;
                     metrics.add(sample.mb_per_second);
+                    throughput_samples.push(sample.mb_per_second);
                     on_sample(sample);
                 };
                 match phase {
@@ -245,6 +247,7 @@ impl BenchmarkRunner {
             bytes_processed,
             stopped,
             metrics: metrics.finish(),
+            throughput_samples,
         })
     }
 }
@@ -304,7 +307,7 @@ pub struct BenchmarkRunnerReport {
 }
 
 /// Summary for one benchmark runner phase pass.
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkPassReport {
     /// Phase executed by this pass.
     pub phase: StreamingIoPhase,
@@ -316,6 +319,8 @@ pub struct BenchmarkPassReport {
     pub stopped: bool,
     /// Metrics calculated from samples emitted during this pass.
     pub metrics: BenchmarkPassMetrics,
+    /// Throughput samples emitted during this pass, in decimal MB/s.
+    pub throughput_samples: Vec<f64>,
 }
 
 /// Throughput metrics calculated from samples for one benchmark pass.

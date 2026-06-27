@@ -162,6 +162,7 @@ impl TerminalUi {
                     bytes_processed: progress.bytes_processed,
                     stopped: false,
                     metrics: progress.metrics.finish(),
+                    throughput_samples: progress.throughput_samples,
                 });
             }
             self.progress = Some(LivePassProgress {
@@ -171,6 +172,7 @@ impl TerminalUi {
                 total_bytes,
                 current_mb_per_second: 0.0,
                 metrics: MetricsAccumulator::default(),
+                throughput_samples: Vec::new(),
             });
         }
 
@@ -179,6 +181,7 @@ impl TerminalUi {
             progress.bytes_processed = sample.bytes_processed;
             progress.current_mb_per_second = sample.mb_per_second;
             progress.metrics.add(sample.mb_per_second);
+            progress.throughput_samples.push(sample.mb_per_second);
         }
     }
 
@@ -283,21 +286,42 @@ impl TerminalUi {
             );
         }
 
-        let rows = self.pass_summaries.iter().flat_map(|pass| {
-            let metrics = pass.metrics;
-            [
-                ListItem::new(Line::from(format!(
-                    "{} pass {}: Avg {:.1}",
-                    phase_label(pass.phase),
-                    pass.pass_number,
-                    metrics.average_mb_per_second
-                ))),
-                ListItem::new(Line::from(format!(
-                    "Stable {:.1}  Min {:.1}  Drops {}",
-                    metrics.stable_mb_per_second, metrics.minimum_mb_per_second, metrics.drop_count
-                ))),
-            ]
-        });
+        let latest_read_pass = if self.config.test_mode == DiskTestMode::WriteOnceReadLoop
+            && self.config.execution_mode == ExecutionMode::Continuous
+        {
+            self.pass_summaries
+                .iter()
+                .filter(|pass| pass.phase == StreamingIoPhase::Read)
+                .map(|pass| pass.pass_number)
+                .max()
+        } else {
+            None
+        };
+        let rows = self
+            .pass_summaries
+            .iter()
+            .filter(move |pass| {
+                pass.phase != StreamingIoPhase::Read || Some(pass.pass_number) == latest_read_pass
+            })
+            .flat_map(|pass| {
+                let metrics = pass.metrics;
+                let mut rows = vec![
+                    ListItem::new(Line::from(format!(
+                        "{} pass {}: Avg {:.1}",
+                        phase_label(pass.phase),
+                        pass.pass_number,
+                        metrics.average_mb_per_second
+                    ))),
+                    ListItem::new(Line::from(format!(
+                        "Stable {:.1}  Min {:.1}  Drops {}",
+                        metrics.stable_mb_per_second,
+                        metrics.minimum_mb_per_second,
+                        metrics.drop_count
+                    ))),
+                ];
+                rows.extend(pass_chart_rows(pass, summary.width.saturating_sub(4)));
+                rows
+            });
         frame.render_widget(
             List::new(rows).block(Block::new().title("Pass summaries").borders(Borders::ALL)),
             summary,
@@ -380,6 +404,77 @@ struct LivePassProgress {
     total_bytes: u64,
     current_mb_per_second: f64,
     metrics: MetricsAccumulator,
+    throughput_samples: Vec<f64>,
+}
+
+fn pass_chart_rows(pass: &BenchmarkPassReport, width: u16) -> Vec<ListItem<'static>> {
+    if pass.throughput_samples.is_empty() {
+        return Vec::new();
+    }
+    let width = usize::from(width);
+    if width < 16 {
+        return vec![ListItem::new(Line::from("Chart MB/s: too narrow"))];
+    }
+
+    let max = pass
+        .throughput_samples
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let plot_width = width.saturating_sub(8).min(32);
+    let points = chart_points(&pass.throughput_samples, plot_width);
+    let top = chart_row(max, max, &points);
+    let mid_value = max / 2.0;
+    let mid = chart_row(mid_value, mid_value, &points);
+    let bottom = chart_row(0.0, 0.0, &points);
+    let strip = stability_strip(&points, max);
+
+    vec![
+        ListItem::new(Line::from("Chart MB/s")),
+        ListItem::new(Line::from(top)),
+        ListItem::new(Line::from(mid)),
+        ListItem::new(Line::from(bottom)),
+        ListItem::new(Line::from(format!("Stability {strip}"))),
+    ]
+}
+
+fn chart_points(samples: &[f64], width: usize) -> Vec<f64> {
+    if samples.len() <= width {
+        return samples.to_vec();
+    }
+    (0..width)
+        .map(|index| {
+            let sample_index = index * (samples.len() - 1) / (width - 1);
+            samples[sample_index]
+        })
+        .collect()
+}
+
+fn chart_row(label: f64, threshold: f64, samples: &[f64]) -> String {
+    let points = samples
+        .iter()
+        .map(|sample| if *sample >= threshold { '*' } else { ' ' })
+        .collect::<String>();
+    format!("{label:>5.1} |{points}")
+}
+
+fn stability_strip(samples: &[f64], max: f64) -> String {
+    samples
+        .iter()
+        .map(|sample| {
+            let ratio = sample / max;
+            if ratio >= 0.85 {
+                '.'
+            } else if ratio >= 0.60 {
+                '-'
+            } else if ratio >= 0.10 {
+                '!'
+            } else {
+                'x'
+            }
+        })
+        .collect()
 }
 
 /// Complete benchmark settings for one configured run.

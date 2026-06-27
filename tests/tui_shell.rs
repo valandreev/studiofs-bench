@@ -153,6 +153,7 @@ fn terminal_ui_renders_live_progress_and_pass_summary_metrics() {
                 minimum_mb_per_second: 90.0,
                 drop_count: 1,
             },
+            throughput_samples: Vec::new(),
         }],
     );
 
@@ -165,6 +166,66 @@ fn terminal_ui_renders_live_progress_and_pass_summary_metrics() {
     assert!(output.contains("Stable 120.0"));
     assert!(output.contains("Min 90.0"));
     assert!(output.contains("Drops 1"));
+}
+
+#[test]
+fn terminal_ui_renders_completed_pass_chart_and_stability_strip() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::Submit);
+    for mb_per_second in [120.0, 90.0, 50.0, 8.0] {
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 1_000_000,
+            mb_per_second,
+        });
+    }
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Read,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 1_000_000,
+        mb_per_second: 90.0,
+    });
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("Chart MB/s"));
+    assert!(output.contains("120.0 |"));
+    assert!(output.contains("Stability"));
+    assert!(output.contains(".-!x"));
+}
+
+#[test]
+fn terminal_ui_replaces_read_chart_with_latest_continuous_read_pass() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::NextValue);
+    ui.handle_action(UiAction::NextValue);
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::MoveDown);
+    ui.handle_action(UiAction::NextValue);
+    ui.finish_run_with_passes(
+        "Done",
+        vec![
+            pass_report(StreamingIoPhase::Read, 1, 10.0),
+            pass_report(StreamingIoPhase::Read, 2, 90.0),
+        ],
+    );
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(!output.contains("read pass 1"));
+    assert!(output.contains("read pass 2"));
 }
 
 #[test]
@@ -235,4 +296,25 @@ fn terminal_ui_keeps_progress_gauge_visible_with_live_text() {
 
     assert!(output.contains("█"));
     assert!(output.contains("Current write: 125.0 MB/s"));
+}
+
+fn pass_report(
+    phase: StreamingIoPhase,
+    pass_number: u64,
+    mb_per_second: f64,
+) -> BenchmarkPassReport {
+    BenchmarkPassReport {
+        phase,
+        pass_number,
+        bytes_processed: 1_000_000,
+        stopped: false,
+        metrics: BenchmarkPassMetrics {
+            sample_count: 1,
+            average_mb_per_second: mb_per_second,
+            stable_mb_per_second: mb_per_second,
+            minimum_mb_per_second: mb_per_second,
+            drop_count: 0,
+        },
+        throughput_samples: vec![mb_per_second],
+    }
 }
