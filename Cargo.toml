@@ -16,6 +16,8 @@ dbg_macro = "warn"
 todo = "warn"
 
 [dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
