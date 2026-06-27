@@ -1,3 +1,5 @@
+//! Binary smoke tests.
+
 use std::process::Command;
 
 #[test]
