@@ -318,11 +318,13 @@ impl StreamingIoEngine {
         fill_benchmark_buffer(&mut buffer);
         let mut report = StreamingIoReport::default();
 
-        let cache_control = CacheControl::new(cache_mode);
         report.metadata.cache_mode = cache_mode;
-        report.metadata.cache_method = cache_control.method();
+        report.metadata.cache_method = match cache_mode {
+            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
+            CacheMode::Disabled => disabled_cache_method(),
+        };
 
-        let mut output = cache_control.create(path)?;
+        let mut output = create_file(path, cache_mode)?;
         report.bytes_written = stream_write(
             &mut output,
             &buffer,
@@ -336,10 +338,10 @@ impl StreamingIoEngine {
             return Ok(report);
         }
 
-        cache_control.after_write(&output);
+        after_cache_io(&output, cache_mode);
         drop(output);
 
-        let mut input = cache_control.open(path)?;
+        let mut input = open_file(path, cache_mode)?;
         report.bytes_read = stream_read(
             &mut input,
             &mut buffer,
@@ -347,43 +349,10 @@ impl StreamingIoEngine {
             &mut on_sample,
             &mut should_stop,
         )?;
-        cache_control.after_read(&input);
+        after_cache_io(&input, cache_mode);
         report.stopped = report.bytes_read < total_bytes;
 
         Ok(report)
-    }
-}
-
-struct CacheControl {
-    mode: CacheMode,
-}
-
-impl CacheControl {
-    fn new(mode: CacheMode) -> Self {
-        Self { mode }
-    }
-
-    fn method(&self) -> CacheControlMethod {
-        match self.mode {
-            CacheMode::Enabled => CacheControlMethod::NormalFileIo,
-            CacheMode::Disabled => disabled_cache_method(),
-        }
-    }
-
-    fn create(&self, path: &std::path::Path) -> Result<File, StreamingIoError> {
-        create_file(path, self.mode)
-    }
-
-    fn open(&self, path: &std::path::Path) -> Result<File, StreamingIoError> {
-        open_file(path, self.mode)
-    }
-
-    fn after_write(&self, file: &File) {
-        after_cache_io(file, self.mode);
-    }
-
-    fn after_read(&self, file: &File) {
-        after_cache_io(file, self.mode);
     }
 }
 
