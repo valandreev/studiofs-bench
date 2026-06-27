@@ -27,6 +27,7 @@ fn terminal_ui_shows_editable_benchmark_settings() {
 fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
     let mut ui = TerminalUi::default();
 
+    ui.handle_action(UiAction::Backspace);
     for value in "/tmp/bench".chars() {
         ui.handle_action(UiAction::InsertText(value));
     }
@@ -50,11 +51,23 @@ fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
 fn terminal_ui_appends_target_path_characters_as_text() {
     let mut ui = TerminalUi::default();
 
+    ui.handle_action(UiAction::Backspace);
     for value in "/tmp".chars() {
         ui.handle_action(UiAction::InsertText(value));
     }
 
     assert_eq!(ui.config().target_path, PathBuf::from("/tmp"));
+}
+
+#[test]
+fn terminal_ui_allows_relative_paths_starting_with_dot() {
+    let mut ui = TerminalUi::default();
+
+    for value in "/bench".chars() {
+        ui.handle_action(UiAction::InsertText(value));
+    }
+
+    assert_eq!(ui.config().target_path, PathBuf::from("./bench"));
 }
 
 #[test]

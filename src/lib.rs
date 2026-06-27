@@ -105,11 +105,7 @@ impl TerminalUi {
             UiAction::PreviousValue => self.change_selected(false),
             UiAction::NextValue => self.change_selected(true),
             UiAction::InsertText(value) if self.selected == TARGET_SETTING => {
-                let mut path = if self.config.target_path == Path::new(".") {
-                    String::new()
-                } else {
-                    self.config.target_path.display().to_string()
-                };
+                let mut path = self.config.target_path.display().to_string();
                 path.push(value);
                 self.config.target_path = PathBuf::from(path);
             }
@@ -165,10 +161,8 @@ impl TerminalUi {
                 let marker = if index == self.selected { "> " } else { "  " };
                 ListItem::new(Line::from(vec![
                     Span::raw(marker),
-                    Span::styled(
-                        format!("{name}: "),
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(name, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(": ", Style::new().add_modifier(Modifier::BOLD)),
                     Span::raw(value),
                 ]))
             })
