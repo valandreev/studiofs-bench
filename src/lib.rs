@@ -386,7 +386,7 @@ fn apply_open_options(options: &mut OpenOptions, mode: CacheMode) {
 }
 
 #[cfg(not(windows))]
-fn apply_open_options(_options: &mut OpenOptions, _mode: CacheMode) {}
+fn apply_open_options(_: &mut OpenOptions, _: CacheMode) {}
 
 #[cfg(target_os = "macos")]
 fn apply_file_options(file: &File, mode: CacheMode) {
@@ -394,12 +394,13 @@ fn apply_file_options(file: &File, mode: CacheMode) {
 
     if mode == CacheMode::Disabled {
         // SAFETY: `file` owns a valid file descriptor and `F_NOCACHE` expects an int flag.
+        // Errors are ignored because disabled cache mode is best-effort.
         let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn apply_file_options(_file: &File, _mode: CacheMode) {}
+fn apply_file_options(_: &File, _: CacheMode) {}
 
 #[cfg(target_os = "linux")]
 fn after_cache_io(file: &File, mode: CacheMode) {
@@ -407,12 +408,13 @@ fn after_cache_io(file: &File, mode: CacheMode) {
 
     if mode == CacheMode::Disabled {
         // SAFETY: `file` owns a valid file descriptor. This is an advisory best-effort hint.
+        // Errors are ignored because disabled cache mode is best-effort.
         let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn after_cache_io(_file: &File, _mode: CacheMode) {}
+fn after_cache_io(_: &File, _: CacheMode) {}
 
 #[cfg(windows)]
 fn disabled_cache_method() -> CacheControlMethod {
