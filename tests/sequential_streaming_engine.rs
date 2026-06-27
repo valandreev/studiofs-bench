@@ -21,7 +21,7 @@ fn engine_writes_reads_and_reports_sequential_samples() {
     assert_eq!(report.bytes_written, 10);
     assert_eq!(report.bytes_read, 10);
     assert_eq!(fs::metadata(&path).unwrap().len(), 10);
-    assert!(fs::read(&path).unwrap().iter().any(|byte| *byte != 0));
+    assert_eq!(fs::read(&path).unwrap(), vec![0, 0, 0, 0, 4, 0, 0, 0, 8, 0]);
     assert_eq!(
         samples
             .iter()

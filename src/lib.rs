@@ -327,7 +327,7 @@ impl StreamingIoEngine {
         let mut output = create_file(path, cache_mode)?;
         report.bytes_written = stream_write(
             &mut output,
-            &buffer,
+            &mut buffer,
             total_bytes,
             &mut on_sample,
             &mut should_stop,
@@ -360,7 +360,9 @@ fn create_file(path: &std::path::Path, mode: CacheMode) -> Result<File, Streamin
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     apply_open_options(&mut options, mode);
-    Ok(options.open(path)?)
+    let file = options.open(path)?;
+    apply_file_options(&file, mode);
+    Ok(file)
 }
 
 fn open_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
@@ -434,7 +436,7 @@ fn disabled_cache_method() -> CacheControlMethod {
 
 fn stream_write(
     output: &mut File,
-    buffer: &[u8],
+    buffer: &mut [u8],
     total_bytes: u64,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
@@ -450,6 +452,7 @@ fn stream_write(
         let offset = processed;
         let chunk = chunk_len(buffer.len(), total_bytes - processed);
         let is_final_chunk = processed + chunk as u64 == total_bytes;
+        stamp_block_offset(&mut buffer[..chunk], offset);
         let io_start = Instant::now();
         output.write_all(&buffer[..chunk])?;
         if is_final_chunk {
@@ -575,6 +578,12 @@ pub struct StreamingIoReport {
     pub bytes_read: u64,
     /// Whether the caller requested a clean stop between blocks.
     pub stopped: bool,
+}
+
+fn stamp_block_offset(chunk: &mut [u8], offset: u64) {
+    let stamp = offset.to_le_bytes();
+    let stamp_len = chunk.len().min(stamp.len());
+    chunk[..stamp_len].copy_from_slice(&stamp[..stamp_len]);
 }
 
 /// Metadata describing selected benchmark run behavior.
