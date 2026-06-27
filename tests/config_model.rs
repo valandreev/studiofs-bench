@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use studiofs_bench::{
-    BenchmarkConfig, CacheMode, ConfigError, ExecutionMode, FileLayout, RunMode, WorkloadPreset,
-    WorkloadSize,
+    BenchmarkConfig, CacheMode, ConfigError, ExecutionMode, FileLayout, RunMode, Workload,
+    WorkloadPreset, WorkloadSize,
 };
 
 #[test]
@@ -96,4 +96,87 @@ fn config_serializes_report_ready_values() {
     assert_eq!(value["keep_files"], true);
     assert_eq!(value["save_report"], false);
     assert_eq!(value["execution_mode"], "continuous");
+}
+
+#[test]
+fn workload_create_for_bytes_writes_single_file_under_unique_run_dir() {
+    let target = TestDir::new("studiofs-bench-sfs-572-single");
+
+    let workload = Workload::create_for_bytes(target.path(), 17, FileLayout::SingleFile).unwrap();
+
+    assert_eq!(workload.files().len(), 1);
+    assert_eq!(workload.total_bytes(), 17);
+    assert_eq!(workload.run_dir().parent(), Some(target.path()));
+    assert!(
+        workload.files()[0]
+            .path
+            .ends_with("studiofs-bench-workload-000.bin")
+    );
+    assert_eq!(
+        std::fs::metadata(&workload.files()[0].path).unwrap().len(),
+        17
+    );
+    assert!(
+        std::fs::read(&workload.files()[0].path)
+            .unwrap()
+            .iter()
+            .any(|byte| *byte != 0)
+    );
+
+    let user_file = target.path().join("user-file.txt");
+    std::fs::write(&user_file, b"keep").unwrap();
+
+    let run_dir = workload.run_dir().to_owned();
+    workload.cleanup().unwrap();
+
+    assert!(!run_dir.exists());
+    assert!(user_file.exists());
+}
+
+#[test]
+fn workload_create_for_bytes_writes_100_varied_files_with_exact_total_size() {
+    let target = TestDir::new("studiofs-bench-sfs-572-100");
+
+    let workload =
+        Workload::create_for_bytes(target.path(), 10_000, FileLayout::HundredFilesPlusMinusFive)
+            .unwrap();
+    let sizes = workload
+        .files()
+        .iter()
+        .map(|file| std::fs::metadata(&file.path).unwrap().len())
+        .collect::<Vec<_>>();
+
+    assert_eq!(sizes.len(), 100);
+    assert_eq!(sizes.iter().sum::<u64>(), 10_000);
+    assert!(sizes.iter().all(|size| (95..=105).contains(size)));
+    assert!(sizes.windows(2).any(|pair| pair[0] != pair[1]));
+    assert!(
+        workload
+            .files()
+            .iter()
+            .all(|file| file.path.starts_with(workload.run_dir()))
+    );
+}
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

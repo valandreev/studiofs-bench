@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -171,10 +171,198 @@ pub enum RunMode {
 pub enum FileLayout {
     /// Store the workload in one file.
     SingleFile,
+    /// Split the workload into 100 files with slight deterministic size variance.
+    HundredFilesPlusMinusFive,
     /// Split the workload into files of this decimal MB size.
     ///
     /// The final file may be smaller when the workload is not evenly divisible.
     FixedFileSizeMb(u64),
+}
+
+/// Generated benchmark workload inside one temporary run directory.
+#[derive(Debug)]
+pub struct Workload {
+    run_dir: PathBuf,
+    files: Vec<WorkloadFile>,
+}
+
+impl Workload {
+    /// Creates workload files from a complete benchmark config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when config validation or filesystem I/O fails.
+    pub fn create(config: &BenchmarkConfig) -> Result<Self, WorkloadError> {
+        config.validate()?;
+        let total_bytes = config
+            .workload_size
+            .bytes()
+            .ok_or(ConfigError::WorkloadOverflow)?;
+        Self::create_for_bytes(&config.target_path, total_bytes, config.file_layout)
+    }
+
+    /// Creates workload files with an explicit byte size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when the size/layout combination is invalid or filesystem I/O
+    /// fails.
+    pub fn create_for_bytes(
+        target_path: impl AsRef<Path>,
+        total_bytes: u64,
+        file_layout: FileLayout,
+    ) -> Result<Self, WorkloadError> {
+        let target_path = target_path.as_ref();
+        let file_sizes = workload_file_sizes(total_bytes, file_layout)?;
+        let run_dir = create_unique_run_dir(target_path)?;
+        let mut files = Vec::with_capacity(file_sizes.len());
+
+        for (index, bytes) in file_sizes.into_iter().enumerate() {
+            let path = run_dir.join(format!("studiofs-bench-workload-{index:03}.bin"));
+            write_workload_file(&path, bytes)?;
+            files.push(WorkloadFile { path, bytes });
+        }
+
+        Ok(Self { run_dir, files })
+    }
+
+    /// Temporary benchmark run directory containing this workload.
+    #[must_use]
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// Files created for this workload.
+    #[must_use]
+    pub fn files(&self) -> &[WorkloadFile] {
+        &self.files
+    }
+
+    /// Total bytes across all created workload files.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.bytes).sum()
+    }
+
+    /// Removes only this workload's temporary run directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkloadError`] when removing the run directory fails.
+    pub fn cleanup(self) -> Result<(), WorkloadError> {
+        std::fs::remove_dir_all(self.run_dir)?;
+        Ok(())
+    }
+}
+
+/// One generated benchmark workload file.
+#[derive(Debug)]
+pub struct WorkloadFile {
+    /// Workload file path.
+    pub path: PathBuf,
+    /// Workload file size in bytes.
+    pub bytes: u64,
+}
+
+fn workload_file_sizes(
+    total_bytes: u64,
+    file_layout: FileLayout,
+) -> Result<Vec<u64>, WorkloadError> {
+    if total_bytes == 0 {
+        return Err(ConfigError::ZeroWorkload.into());
+    }
+
+    match file_layout {
+        FileLayout::SingleFile => Ok(vec![total_bytes]),
+        FileLayout::HundredFilesPlusMinusFive => hundred_file_sizes(total_bytes),
+        FileLayout::FixedFileSizeMb(file_size_mb) => fixed_file_sizes(total_bytes, file_size_mb),
+    }
+}
+
+fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
+    const FILE_COUNT: usize = 100;
+    const WEIGHT_SUM: u64 = 9_995;
+
+    if total_bytes < FILE_COUNT as u64 {
+        return Err(WorkloadError::WorkloadTooSmallForLayout);
+    }
+
+    let mut sizes = Vec::with_capacity(FILE_COUNT);
+    let mut allocated = 0_u128;
+    for index in 0..FILE_COUNT {
+        let weight = 95 + index as u64 % 11;
+        let size = (u128::from(total_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
+        allocated += u128::from(size);
+        sizes.push(size);
+    }
+
+    let mut remainder = total_bytes - allocated as u64;
+    for size in &mut sizes {
+        if remainder == 0 {
+            break;
+        }
+        *size += 1;
+        remainder -= 1;
+    }
+
+    Ok(sizes)
+}
+
+fn fixed_file_sizes(total_bytes: u64, file_size_mb: u64) -> Result<Vec<u64>, WorkloadError> {
+    if file_size_mb == 0 {
+        return Err(ConfigError::ZeroFileSize.into());
+    }
+
+    let Some(file_bytes) = file_size_mb.checked_mul(DECIMAL_MB) else {
+        return Err(ConfigError::WorkloadOverflow.into());
+    };
+    if file_bytes > total_bytes {
+        return Err(ConfigError::FileLayoutExceedsWorkload.into());
+    }
+
+    let mut sizes = Vec::new();
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        let size = remaining.min(file_bytes);
+        sizes.push(size);
+        remaining -= size;
+    }
+
+    Ok(sizes)
+}
+
+fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
+    if target_path.as_os_str().is_empty() {
+        return Err(ConfigError::EmptyTargetPath.into());
+    }
+
+    std::fs::create_dir_all(target_path)?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = target_path.join(format!("studiofs-bench-run-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+fn write_workload_file(path: &Path, total_bytes: u64) -> Result<(), WorkloadError> {
+    let buffer_size = usize::try_from(total_bytes)
+        .unwrap_or(DEFAULT_STREAMING_BLOCK_BYTES)
+        .min(DEFAULT_STREAMING_BLOCK_BYTES);
+    let mut buffer = vec![0_u8; buffer_size];
+    fill_benchmark_buffer(&mut buffer);
+
+    let mut file = File::create(path)?;
+    let mut written = 0_u64;
+    while written < total_bytes {
+        let chunk = chunk_len(buffer.len(), total_bytes - written);
+        file.write_all(&buffer[..chunk])?;
+        written += chunk as u64;
+    }
+    file.sync_all()?;
+
+    Ok(())
 }
 
 /// Cache behavior expected for a benchmark run.
@@ -243,6 +431,51 @@ impl fmt::Display for ConfigError {
 }
 
 impl Error for ConfigError {}
+
+/// Workload generation error.
+#[derive(Debug)]
+pub enum WorkloadError {
+    /// Benchmark configuration is invalid for workload generation.
+    Config(ConfigError),
+    /// The requested total size cannot produce non-empty files for the layout.
+    WorkloadTooSmallForLayout,
+    /// Filesystem I/O failed.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for WorkloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => write!(f, "{error}"),
+            Self::WorkloadTooSmallForLayout => {
+                f.write_str("workload size is too small for the selected file layout")
+            }
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for WorkloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::WorkloadTooSmallForLayout => None,
+        }
+    }
+}
+
+impl From<ConfigError> for WorkloadError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<std::io::Error> for WorkloadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 
 /// Sequential streaming write/read engine.
 #[derive(Debug, Copy, Clone)]
@@ -658,6 +891,13 @@ mod tests {
         fill_benchmark_buffer(&mut buffer);
 
         assert_eq!(buffer, [117, 205, 37, 75, 132, 226, 234, 242]);
+    }
+
+    #[test]
+    fn hundred_file_sizes_keep_exact_total_for_large_workloads() {
+        let sizes = hundred_file_sizes(u64::MAX).unwrap();
+
+        assert_eq!(sizes.iter().sum::<u64>(), u64::MAX);
     }
 
     #[test]
