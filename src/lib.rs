@@ -240,7 +240,7 @@ impl TerminalUi {
 
     fn render_metrics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let [live, summary] =
-            Layout::vertical([Constraint::Length(6), Constraint::Min(4)]).areas(area);
+            Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).areas(area);
 
         if let Some(progress) = &self.progress {
             let ratio = if progress.total_bytes == 0 {
@@ -251,12 +251,14 @@ impl TerminalUi {
             .clamp(0.0, 1.0);
             let block = Block::new().title("Progress").borders(Borders::ALL);
             let inner = block.inner(live);
+            frame.render_widget(block, live);
+            let [gauge_area, text_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(inner);
             frame.render_widget(
                 Gauge::default()
-                    .block(block)
                     .gauge_style(Style::new().fg(Color::Green))
                     .ratio(ratio),
-                live,
+                gauge_area,
             );
             let metrics = progress.metrics.finish();
             let text = vec![
@@ -274,7 +276,7 @@ impl TerminalUi {
                 Line::from(format!("Avg {:.1}", metrics.average_mb_per_second)),
                 Line::from(format!("Stable {:.1}", metrics.stable_mb_per_second)),
             ];
-            frame.render_widget(Paragraph::new(text), inner);
+            frame.render_widget(Paragraph::new(text), text_area);
         } else {
             frame.render_widget(
                 Paragraph::new("No samples yet")

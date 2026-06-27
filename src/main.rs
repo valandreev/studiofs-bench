@@ -143,14 +143,17 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
             for sample in run.samples.try_iter() {
                 ui.observe_sample(sample);
             }
-            ui.finish_run_with_passes(
-                match &result {
-                    Ok(report) if report.stopped => String::from("Stopped"),
-                    Ok(report) => format!("Done - {} passes", report.passes.len()),
-                    Err(error) => format!("Error - {error}"),
-                },
-                result.ok().map_or_else(Vec::new, |report| report.passes),
-            );
+            match result {
+                Ok(report) => {
+                    let message = if report.stopped {
+                        String::from("Stopped")
+                    } else {
+                        format!("Done - {} passes", report.passes.len())
+                    };
+                    ui.finish_run_with_passes(message, report.passes);
+                }
+                Err(error) => ui.finish_run(format!("Error - {error}")),
+            }
             *running = None;
             true
         }
@@ -273,6 +276,43 @@ mod tests {
         assert!(changed);
         assert!(running.is_none());
         assert_render_contains(&ui, "125.0 MB/s");
+    }
+
+    #[test]
+    fn finish_completed_run_preserves_pass_summaries_when_run_errors() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Write,
+            pass_number: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 1_000_000,
+            mb_per_second: 100.0,
+        });
+        ui.observe_sample(StreamingIoSample {
+            phase: StreamingIoPhase::Read,
+            pass_number: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            offset: 0,
+            bytes_processed: 500_000,
+            mb_per_second: 80.0,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        done_tx.send(Err(String::from("failed"))).unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert_render_contains(&ui, "write pass 1: Avg 100.0");
+        assert_render_contains(&ui, "Error - failed");
     }
 
     #[test]

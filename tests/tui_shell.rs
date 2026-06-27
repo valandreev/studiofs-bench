@@ -215,3 +215,24 @@ fn terminal_ui_renders_progress_megabytes_with_fractional_precision() {
 
     assert!(output.contains("0.5 /"));
 }
+
+#[test]
+fn terminal_ui_keeps_progress_gauge_visible_with_live_text() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.handle_action(UiAction::Submit);
+    ui.observe_sample(StreamingIoSample {
+        phase: StreamingIoPhase::Write,
+        pass_number: 1,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        offset: 0,
+        bytes_processed: 2_000_000_000,
+        mb_per_second: 125.0,
+    });
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("█"));
+    assert!(output.contains("Current write: 125.0 MB/s"));
+}
