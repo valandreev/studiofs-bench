@@ -7,6 +7,6 @@ fn binary_prints_name() {
         .expect("run studiofs-bench");
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "studiofs-bench\n");
+    assert_eq!(output.stdout, b"studiofs-bench\n");
     assert!(output.stderr.is_empty());
 }
