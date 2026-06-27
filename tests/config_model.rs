@@ -13,6 +13,7 @@ fn default_config_uses_documented_benchmark_contract() {
 
     assert_eq!(config.target_path, PathBuf::from("E:/bench-target"));
     assert_eq!(config.workload_size.gigabytes(), 4);
+    assert_eq!(config.workload_size.megabytes(), Some(4_000));
     assert_eq!(config.run_mode, RunMode::LocalFilesystem);
     assert_eq!(config.file_layout, FileLayout::SingleFile);
     assert_eq!(config.cache_mode, CacheMode::Warm);
@@ -24,11 +25,19 @@ fn default_config_uses_documented_benchmark_contract() {
 }
 
 #[test]
-fn workload_size_saturates_decimal_unit_conversions() {
+fn workload_size_overflows_decimal_unit_conversions() {
     let workload_size = WorkloadSize::CustomGb(u64::MAX);
 
-    assert_eq!(workload_size.megabytes(), u64::MAX);
-    assert_eq!(workload_size.bytes(), u64::MAX);
+    assert_eq!(workload_size.megabytes(), None);
+    assert_eq!(workload_size.bytes(), None);
+}
+
+#[test]
+fn validate_rejects_workload_that_overflows_bytes() {
+    let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
+    config.workload_size = WorkloadSize::CustomGb(u64::MAX / 1_000);
+
+    assert_eq!(config.validate(), Err(ConfigError::WorkloadOverflow));
 }
 
 #[test]

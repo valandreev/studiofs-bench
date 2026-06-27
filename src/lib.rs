@@ -56,8 +56,16 @@ impl BenchmarkConfig {
             return Err(ConfigError::EmptyTargetPath);
         }
 
-        if self.workload_size.gigabytes() == 0 {
+        let Some(workload_mb) = self.workload_size.megabytes() else {
+            return Err(ConfigError::WorkloadOverflow);
+        };
+
+        if workload_mb == 0 {
             return Err(ConfigError::ZeroWorkload);
+        }
+
+        if self.workload_size.bytes().is_none() {
+            return Err(ConfigError::WorkloadOverflow);
         }
 
         let FileLayout::FixedFileSizeMb(file_size_mb) = self.file_layout else {
@@ -68,7 +76,7 @@ impl BenchmarkConfig {
             return Err(ConfigError::ZeroFileSize);
         }
 
-        if file_size_mb > self.workload_size.megabytes() {
+        if file_size_mb > workload_mb {
             return Err(ConfigError::FileLayoutExceedsWorkload);
         }
 
@@ -96,13 +104,13 @@ impl WorkloadSize {
     }
 
     /// Size in decimal megabytes.
-    pub fn megabytes(self) -> u64 {
-        self.gigabytes().saturating_mul(MB_PER_GB)
+    pub fn megabytes(self) -> Option<u64> {
+        self.gigabytes().checked_mul(MB_PER_GB)
     }
 
     /// Size in decimal bytes.
-    pub fn bytes(self) -> u64 {
-        self.megabytes().saturating_mul(DECIMAL_MB)
+    pub fn bytes(self) -> Option<u64> {
+        self.megabytes()?.checked_mul(DECIMAL_MB)
     }
 }
 
@@ -185,6 +193,8 @@ pub enum ConfigError {
     ZeroFileSize,
     /// The fixed file size is larger than the total workload.
     FileLayoutExceedsWorkload,
+    /// The workload size is too large for decimal byte representation.
+    WorkloadOverflow,
 }
 
 impl fmt::Display for ConfigError {
@@ -196,6 +206,7 @@ impl fmt::Display for ConfigError {
             Self::FileLayoutExceedsWorkload => {
                 f.write_str("file layout size must not exceed total workload size")
             }
+            Self::WorkloadOverflow => f.write_str("workload size is too large"),
         }
     }
 }
