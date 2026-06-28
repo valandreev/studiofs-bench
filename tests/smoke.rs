@@ -53,7 +53,7 @@ impl TestDir {
     fn new(name: &str) -> Self {
         let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("{name}-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        std::fs::remove_dir_all(&path).ok();
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -65,6 +65,6 @@ impl TestDir {
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        std::fs::remove_dir_all(&self.path).ok();
     }
 }

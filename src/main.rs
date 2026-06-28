@@ -196,7 +196,7 @@ fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
         "phase,pass_number,bytes_processed,stopped,sample_count,average_mb_per_second,stable_mb_per_second,minimum_mb_per_second,drop_count\n",
     );
     for pass in passes {
-        let _ = writeln!(
+        writeln!(
             csv,
             "{:?},{},{},{},{},{},{},{},{}",
             pass.phase,
@@ -208,7 +208,8 @@ fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
             pass.metrics.stable_mb_per_second,
             pass.metrics.minimum_mb_per_second,
             pass.metrics.drop_count
-        );
+        )
+        .expect("writing CSV into a String should not fail");
     }
     csv
 }
@@ -527,6 +528,70 @@ mod tests {
         };
 
         assert_eq!(error, "scripted mode does not support continuous execution");
+    }
+
+    #[test]
+    fn scripted_options_parse_scripted_settings() {
+        let args = [
+            "--target",
+            "E:/bench-target",
+            "--workload-bytes",
+            "8",
+            "--run-mode",
+            "mounted",
+            "--mode",
+            "write-only",
+            "--layout",
+            "hundred-files-plus-minus-five",
+            "--cache",
+            "disabled",
+            "--keep-files",
+            "--save-report",
+            "E:/reports/bench",
+        ]
+        .map(String::from);
+
+        let options = match ScriptedOptions::parse(&args) {
+            Ok(options) => options,
+            Err(error) => panic!("scripted options should parse: {error}"),
+        };
+
+        assert_eq!(options.config.target_path, PathBuf::from("E:/bench-target"));
+        assert_eq!(options.workload_bytes, Some(8));
+        assert_eq!(options.config.run_mode, RunMode::MountedFilesystem);
+        assert_eq!(options.config.test_mode, DiskTestMode::WriteOnly);
+        assert_eq!(
+            options.config.file_layout,
+            FileLayout::HundredFilesPlusMinusFive
+        );
+        assert_eq!(options.config.cache_mode, CacheMode::Disabled);
+        assert!(options.config.keep_files);
+        assert!(options.config.save_report);
+        assert_eq!(options.report_path, Some(PathBuf::from("E:/reports/bench")));
+    }
+
+    #[test]
+    fn scripted_options_reject_missing_argument_value() {
+        let args = ["--target"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("missing argument value should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "missing argument value");
+    }
+
+    #[test]
+    fn scripted_options_reject_invalid_number() {
+        let args = ["--workload-bytes", "nope"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("invalid number should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "invalid unsigned integer: nope");
     }
 
     fn assert_render_contains(ui: &TerminalUi, expected: &str) {
