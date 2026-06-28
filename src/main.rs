@@ -1,7 +1,10 @@
 //! Terminal UI entrypoint for studiofs-bench.
 
 use std::{
+    env,
+    fmt::Write as _,
     io::{self, IsTerminal},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,11 +16,22 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, StreamingIoSample, TerminalUi,
-    UiAction,
+    BenchmarkConfig, BenchmarkPassReport, BenchmarkRunner, BenchmarkRunnerReport, CacheMode,
+    DiskTestMode, ExecutionMode, FileLayout, RunMode, StreamingIoSample, TerminalUi, UiAction,
+    Workload, WorkloadSize,
 };
 
 fn main() -> io::Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--scripted") {
+        let args = args
+            .iter()
+            .filter(|arg| arg.as_str() != "--scripted")
+            .cloned()
+            .collect::<Vec<_>>();
+        return run_scripted(&args).map_err(io::Error::other);
+    }
+
     if !io::stdout().is_terminal() {
         println!("studiofs-bench");
         return Ok(());
@@ -27,6 +41,202 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal);
     ratatui::restore();
     result
+}
+
+fn run_scripted(args: &[String]) -> Result<(), String> {
+    let options = ScriptedOptions::parse(args)?;
+    let runner = BenchmarkRunner::default();
+    let report = if let Some(bytes) = options.workload_bytes {
+        let workload = Workload::create_for_bytes(
+            &options.config.target_path,
+            bytes,
+            options.config.file_layout,
+        )
+        .map_err(|error| error.to_string())?;
+        runner
+            .run_workload(workload, &options.config, |_| {}, || false)
+            .map_err(|error| error.to_string())?
+    } else {
+        runner
+            .run(&options.config, |_| {}, || false)
+            .map_err(|error| error.to_string())?
+    };
+
+    if let Some(path) = &options.report_path {
+        save_reports(path, &options.config, options.workload_bytes, &report)?;
+    }
+
+    println!("Done - {} passes", report.passes.len());
+    Ok(())
+}
+
+struct ScriptedOptions {
+    config: BenchmarkConfig,
+    workload_bytes: Option<u64>,
+    report_path: Option<PathBuf>,
+}
+
+impl ScriptedOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut config = BenchmarkConfig::for_target(PathBuf::from("."));
+        config.save_report = false;
+        let mut workload_bytes = None;
+        let mut report_path = None;
+        let mut args = args.iter().map(String::as_str);
+
+        while let Some(arg) = args.next() {
+            match arg {
+                "--target" => config.target_path = PathBuf::from(next_arg(&mut args)?),
+                "--workload-gb" => {
+                    config.workload_size = WorkloadSize::CustomGb(parse_u64(next_arg(&mut args)?)?)
+                }
+                "--workload-bytes" => workload_bytes = Some(parse_u64(next_arg(&mut args)?)?),
+                "--run-mode" => config.run_mode = parse_run_mode(next_arg(&mut args)?)?,
+                "--mode" => config.test_mode = parse_test_mode(next_arg(&mut args)?)?,
+                "--layout" => config.file_layout = parse_layout(next_arg(&mut args)?)?,
+                "--file-size-mb" => {
+                    config.file_layout =
+                        FileLayout::FixedFileSizeMb(parse_u64(next_arg(&mut args)?)?)
+                }
+                "--cache" => config.cache_mode = parse_cache_mode(next_arg(&mut args)?)?,
+                "--execution" => {
+                    config.execution_mode = parse_execution_mode(next_arg(&mut args)?)?
+                }
+                "--keep-files" => config.keep_files = true,
+                "--save-report" => {
+                    config.save_report = true;
+                    report_path = Some(PathBuf::from(next_arg(&mut args)?));
+                }
+                value => return Err(format!("unknown argument: {value}")),
+            }
+        }
+
+        if config.execution_mode == ExecutionMode::Continuous {
+            return Err(String::from(
+                "scripted mode does not support continuous execution",
+            ));
+        }
+
+        Ok(Self {
+            config,
+            workload_bytes,
+            report_path,
+        })
+    }
+}
+
+fn next_arg<'a>(args: &mut impl Iterator<Item = &'a str>) -> Result<&'a str, String> {
+    args.next()
+        .ok_or_else(|| String::from("missing argument value"))
+}
+
+fn parse_u64(value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid unsigned integer: {value}"))
+}
+
+fn parse_run_mode(value: &str) -> Result<RunMode, String> {
+    match value {
+        "local" | "local-filesystem" => Ok(RunMode::LocalFilesystem),
+        "mounted" | "mounted-filesystem" => Ok(RunMode::MountedFilesystem),
+        _ => Err(format!("invalid run mode: {value}")),
+    }
+}
+
+fn parse_test_mode(value: &str) -> Result<DiskTestMode, String> {
+    match value {
+        "read-write" => Ok(DiskTestMode::ReadWrite),
+        "write-only" => Ok(DiskTestMode::WriteOnly),
+        "write-once-read-loop" => Ok(DiskTestMode::WriteOnceReadLoop),
+        _ => Err(format!("invalid mode: {value}")),
+    }
+}
+
+fn parse_layout(value: &str) -> Result<FileLayout, String> {
+    match value {
+        "single-file" => Ok(FileLayout::SingleFile),
+        "hundred-files-plus-minus-five" => Ok(FileLayout::HundredFilesPlusMinusFive),
+        _ => Err(format!("invalid layout: {value}")),
+    }
+}
+
+fn parse_cache_mode(value: &str) -> Result<CacheMode, String> {
+    match value {
+        "enabled" => Ok(CacheMode::Enabled),
+        "disabled" => Ok(CacheMode::Disabled),
+        _ => Err(format!("invalid cache mode: {value}")),
+    }
+}
+
+fn parse_execution_mode(value: &str) -> Result<ExecutionMode, String> {
+    match value {
+        "run-once" => Ok(ExecutionMode::RunOnce),
+        "continuous" => Ok(ExecutionMode::Continuous),
+        _ => Err(format!("invalid execution mode: {value}")),
+    }
+}
+
+fn save_reports(
+    path: &std::path::Path,
+    config: &BenchmarkConfig,
+    workload_bytes: Option<u64>,
+    report: &BenchmarkRunnerReport,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create report directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let json_path = path.with_extension("json");
+    let csv_path = path.with_extension("csv");
+    let payload = serde_json::json!({
+        "config": config,
+        "workload_bytes": workload_bytes,
+        "report": report,
+    });
+    let json = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
+    std::fs::write(&json_path, json).map_err(|error| {
+        format!(
+            "failed to write JSON report to {}: {error}",
+            json_path.display()
+        )
+    })?;
+    std::fs::write(&csv_path, passes_csv(&report.passes)).map_err(|error| {
+        format!(
+            "failed to write CSV report to {}: {error}",
+            csv_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
+    let mut csv = String::from(
+        "phase,pass_number,bytes_processed,stopped,sample_count,average_mb_per_second,stable_mb_per_second,minimum_mb_per_second,drop_count\n",
+    );
+    for pass in passes {
+        writeln!(
+            csv,
+            "{:?},{},{},{},{},{},{},{},{}",
+            pass.phase,
+            pass.pass_number,
+            pass.bytes_processed,
+            pass.stopped,
+            pass.metrics.sample_count,
+            pass.metrics.average_mb_per_second,
+            pass.metrics.stable_mb_per_second,
+            pass.metrics.minimum_mb_per_second,
+            pass.metrics.drop_count
+        )
+        .expect("writing CSV into a String should not fail");
+    }
+    csv
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
@@ -331,6 +541,82 @@ mod tests {
         assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
         assert!(running.is_none());
+    }
+
+    #[test]
+    fn scripted_options_reject_continuous_execution() {
+        let args = ["--execution", "continuous"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("continuous execution should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "scripted mode does not support continuous execution");
+    }
+
+    #[test]
+    fn scripted_options_parse_scripted_settings() {
+        let args = [
+            "--target",
+            "E:/bench-target",
+            "--workload-bytes",
+            "8",
+            "--run-mode",
+            "mounted",
+            "--mode",
+            "write-only",
+            "--layout",
+            "hundred-files-plus-minus-five",
+            "--cache",
+            "disabled",
+            "--keep-files",
+            "--save-report",
+            "E:/reports/bench",
+        ]
+        .map(String::from);
+
+        let options = match ScriptedOptions::parse(&args) {
+            Ok(options) => options,
+            Err(error) => panic!("scripted options should parse: {error}"),
+        };
+
+        assert_eq!(options.config.target_path, PathBuf::from("E:/bench-target"));
+        assert_eq!(options.workload_bytes, Some(8));
+        assert_eq!(options.config.run_mode, RunMode::MountedFilesystem);
+        assert_eq!(options.config.test_mode, DiskTestMode::WriteOnly);
+        assert_eq!(
+            options.config.file_layout,
+            FileLayout::HundredFilesPlusMinusFive
+        );
+        assert_eq!(options.config.cache_mode, CacheMode::Disabled);
+        assert!(options.config.keep_files);
+        assert!(options.config.save_report);
+        assert_eq!(options.report_path, Some(PathBuf::from("E:/reports/bench")));
+    }
+
+    #[test]
+    fn scripted_options_reject_missing_argument_value() {
+        let args = ["--target"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("missing argument value should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "missing argument value");
+    }
+
+    #[test]
+    fn scripted_options_reject_invalid_number() {
+        let args = ["--workload-bytes", "nope"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("invalid number should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "invalid unsigned integer: nope");
     }
 
     fn assert_render_contains(ui: &TerminalUi, expected: &str) {

@@ -2,6 +2,33 @@
 
 Terminal benchmark binary for StudioFS benchmark experiments.
 
+## Usage
+
+Interactive terminal UI:
+
+```bash
+studiofs-bench
+```
+
+Scripted smoke run:
+
+```bash
+studiofs-bench --scripted --target ./bench-target --workload-bytes 8 --mode write-only --layout single-file --cache enabled --save-report ./bench-report
+```
+
+Scripted options:
+
+- `--target <path>`
+- `--workload-gb <n>` or `--workload-bytes <n>`
+- `--run-mode local|mounted`
+- `--mode read-write|write-only|write-once-read-loop`
+- `--layout single-file|hundred-files-plus-minus-five`
+- `--file-size-mb <n>`
+- `--cache enabled|disabled`
+- `--execution run-once`
+- `--keep-files`
+- `--save-report <path-prefix>` writes `<path-prefix>.json` and `<path-prefix>.csv`
+
 ## Default benchmark configuration
 
 - Target path: required.
