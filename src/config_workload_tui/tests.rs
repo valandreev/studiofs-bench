@@ -55,6 +55,28 @@ fn cleanup_ignores_missing_run_dir() {
 }
 
 #[test]
+fn cleanup_error_includes_run_dir_path() {
+    let run_dir = std::env::temp_dir().join(format!(
+        "studiofs-bench-sfs-579-cleanup-file-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&run_dir);
+    File::create(&run_dir).unwrap();
+    let workload = Workload {
+        run_dir: run_dir.clone(),
+        files: Vec::new(),
+    };
+
+    let error = workload.cleanup().unwrap_err();
+
+    let WorkloadError::PathIo { path, .. } = error else {
+        panic!("cleanup should return a path-aware error: {error}");
+    };
+    assert_eq!(path, run_dir);
+    let _ = std::fs::remove_file(&run_dir);
+}
+
+#[test]
 fn write_workload_files_removes_run_dir_when_file_write_fails() {
     let run_dir = std::env::temp_dir().join(format!(
         "studiofs-bench-sfs-572-partial-{}",

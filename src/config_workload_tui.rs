@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -751,10 +751,14 @@ impl Workload {
     ///
     /// Returns [`WorkloadError`] when removing the run directory fails.
     pub fn cleanup(self) -> Result<(), WorkloadError> {
-        match std::fs::remove_dir_all(self.run_dir) {
+        let run_dir = self.run_dir;
+        match std::fs::remove_dir_all(&run_dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(WorkloadError::PathIo {
+                path: run_dir,
+                source: error,
+            }),
         }
     }
 }
@@ -848,7 +852,7 @@ fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
         return Err(ConfigError::EmptyTargetPath.into());
     }
 
-    std::fs::create_dir_all(target_path)?;
+    std::fs::create_dir_all(target_path).map_err(|error| path_io_error(target_path, error))?;
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -858,7 +862,7 @@ fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
         "studiofs-bench-run-{}-{nanos}-{counter}",
         std::process::id()
     ));
-    std::fs::create_dir(&path)?;
+    std::fs::create_dir(&path).map_err(|error| path_io_error(&path, error))?;
     Ok(path)
 }
 
@@ -891,15 +895,23 @@ fn benchmark_buffer(total_bytes: u64) -> Vec<u8> {
 }
 
 fn write_workload_file(path: &Path, file_size: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
-    let mut file = File::create(path)?;
+    let mut file = File::create(path).map_err(|error| path_io_error(path, error))?;
     let mut written = 0_u64;
     while written < file_size {
         let chunk = chunk_len(buffer.len(), file_size - written);
-        file.write_all(&buffer[..chunk])?;
+        file.write_all(&buffer[..chunk])
+            .map_err(|error| path_io_error(path, error))?;
         written += chunk as u64;
     }
 
     Ok(())
+}
+
+fn path_io_error(path: &Path, source: io::Error) -> WorkloadError {
+    WorkloadError::PathIo {
+        path: path.to_owned(),
+        source,
+    }
 }
 
 /// Cache behavior expected for a benchmark run.
@@ -1066,6 +1078,15 @@ pub enum WorkloadError {
     /// Filesystem I/O failed.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// Filesystem I/O failed for a benchmark path.
+    #[error("I/O failed for {}: {source}", path.display())]
+    PathIo {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Source I/O error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 fn phase_label(phase: StreamingIoPhase) -> &'static str {

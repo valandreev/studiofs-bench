@@ -4,8 +4,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkRunner, DiskTestMode, ExecutionMode, FileLayout, StreamingIoPhase,
-    Workload,
+    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerError, DiskTestMode, ExecutionMode,
+    FileLayout, StreamingIoPhase, Workload,
 };
 
 #[test]
@@ -164,6 +164,33 @@ fn runner_includes_completed_pass_samples_for_terminal_charts() {
         .unwrap();
 
     assert_eq!(report.passes[0].throughput_samples.len(), 2);
+}
+
+#[test]
+fn runner_error_exposes_completed_passes_after_later_phase_fails() {
+    let target = TestDir::new("studiofs-bench-sfs-579-partial-error");
+    let config = BenchmarkConfig::for_target(target.path().to_owned());
+    let workload = Workload::create_for_bytes(target.path(), 4, FileLayout::SingleFile).unwrap();
+    let file = workload.files()[0].path.clone();
+
+    let error = BenchmarkRunner::with_block_size(4)
+        .unwrap()
+        .run_workload(
+            workload,
+            &config,
+            |sample| {
+                if sample.phase == StreamingIoPhase::Write {
+                    std::fs::remove_file(&file).unwrap();
+                }
+            },
+            || false,
+        )
+        .unwrap_err();
+
+    let BenchmarkRunnerError::RunFailed { partial_report, .. } = error else {
+        panic!("runner error should include a partial report: {error}");
+    };
+    assert_eq!(partial_report.passes[0].phase, StreamingIoPhase::Write);
 }
 
 struct TestDir {

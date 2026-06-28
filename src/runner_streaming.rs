@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
@@ -86,7 +86,12 @@ impl BenchmarkRunner {
             report.cleanup_error = Some(error.to_string());
         }
 
-        run_result?;
+        if let Err(error) = run_result {
+            return Err(BenchmarkRunnerError::RunFailed {
+                source: Box::new(error),
+                partial_report: Box::new(report),
+            });
+        }
         Ok(report)
     }
 
@@ -373,6 +378,18 @@ pub enum BenchmarkRunnerError {
     /// Streaming I/O failed.
     #[error("{0}")]
     StreamingIo(#[from] StreamingIoError),
+    /// Benchmark failed after collecting a partial report.
+    #[error(
+        "benchmark failed after {} completed passes: {source}",
+        partial_report.passes.len()
+    )]
+    RunFailed {
+        /// Error that stopped the run.
+        #[source]
+        source: Box<BenchmarkRunnerError>,
+        /// Report accumulated before the failure.
+        partial_report: Box<BenchmarkRunnerReport>,
+    },
 }
 
 /// Sequential streaming write/read engine.
@@ -410,7 +427,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// Returns [`StreamingIoError::PathIo`] when creating, opening, reading,
     /// writing, or syncing the benchmark file fails.
     pub fn run(
         self,
@@ -432,7 +449,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// Returns [`StreamingIoError::PathIo`] when creating, opening, reading,
     /// writing, or syncing the benchmark file fails.
     pub fn run_with_cache_mode(
         self,
@@ -475,7 +492,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, writing, or syncing the file fails.
+    /// Returns [`StreamingIoError::PathIo`] when creating, writing, or syncing the file fails.
     pub fn write_with_cache_mode(
         self,
         path: impl AsRef<std::path::Path>,
@@ -514,6 +531,7 @@ impl StreamingIoEngine {
 
         let mut output = create_file(pass.path, pass.cache_mode)?;
         report.bytes_written = stream_write(
+            pass.path,
             &mut output,
             buffer,
             pass.total_bytes,
@@ -532,7 +550,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when opening or reading the file fails.
+    /// Returns [`StreamingIoError::PathIo`] when opening or reading the file fails.
     pub fn read_with_cache_mode(
         self,
         path: impl AsRef<std::path::Path>,
@@ -570,6 +588,7 @@ impl StreamingIoEngine {
 
         let mut input = open_file(pass.path, pass.cache_mode)?;
         report.bytes_read = stream_read(
+            pass.path,
             &mut input,
             buffer,
             pass.total_bytes,
@@ -613,7 +632,9 @@ fn create_file(path: &std::path::Path, mode: CacheMode) -> Result<File, Streamin
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     apply_open_options(&mut options, mode);
-    let file = options.open(path)?;
+    let file = options
+        .open(path)
+        .map_err(|error| path_io_error(path, error))?;
     apply_file_options(&file, mode);
     Ok(file)
 }
@@ -622,9 +643,18 @@ fn open_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingI
     let mut options = OpenOptions::new();
     options.read(true);
     apply_open_options(&mut options, mode);
-    let file = options.open(path)?;
+    let file = options
+        .open(path)
+        .map_err(|error| path_io_error(path, error))?;
     apply_file_options(&file, mode);
     Ok(file)
+}
+
+fn path_io_error(path: &Path, source: io::Error) -> StreamingIoError {
+    StreamingIoError::PathIo {
+        path: path.to_owned(),
+        source,
+    }
 }
 
 #[cfg(windows)]
@@ -690,6 +720,7 @@ fn disabled_cache_method() -> CacheControlMethod {
 }
 
 fn stream_write(
+    path: &Path,
     output: &mut File,
     buffer: &mut [u8],
     total_bytes: u64,
@@ -710,9 +741,13 @@ fn stream_write(
         let is_final_chunk = processed + chunk as u64 == total_bytes;
         stamp_block_offset(&mut buffer[..chunk], offset);
         let io_start = Instant::now();
-        output.write_all(&buffer[..chunk])?;
+        output
+            .write_all(&buffer[..chunk])
+            .map_err(|error| path_io_error(path, error))?;
         if is_final_chunk {
-            output.sync_all()?;
+            output
+                .sync_all()
+                .map_err(|error| path_io_error(path, error))?;
         }
         elapsed_io += io_start.elapsed();
         processed += chunk as u64;
@@ -729,6 +764,7 @@ fn stream_write(
 }
 
 fn stream_read(
+    path: &Path,
     input: &mut File,
     buffer: &mut [u8],
     total_bytes: u64,
@@ -747,7 +783,9 @@ fn stream_read(
         let offset = processed;
         let chunk = chunk_len(buffer.len(), total_bytes - processed);
         let io_start = Instant::now();
-        input.read_exact(&mut buffer[..chunk])?;
+        input
+            .read_exact(&mut buffer[..chunk])
+            .map_err(|error| path_io_error(path, error))?;
         elapsed_io += io_start.elapsed();
         processed += chunk as u64;
         on_sample(sample(
@@ -875,6 +913,15 @@ pub enum StreamingIoError {
     /// Filesystem I/O failed.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// Filesystem I/O failed for a benchmark path.
+    #[error("I/O failed for {}: {source}", path.display())]
+    PathIo {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Source I/O error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[cfg(test)]
