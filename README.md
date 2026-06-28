@@ -13,7 +13,7 @@ studiofs-bench
 Scripted smoke run:
 
 ```bash
-studiofs-bench --scripted --target ./bench-target --workload-bytes 8 --mode write-only --layout single-file --cache enabled --save-report ./bench-report
+studiofs-bench --scripted --target ./bench-target --workload-bytes 8 --mode write-only --layout single-file --cache enabled --save-report
 ```
 
 Scripted options:
@@ -27,7 +27,7 @@ Scripted options:
 - `--cache enabled|disabled`
 - `--execution run-once`
 - `--keep-files`
-- `--save-report <path-prefix>` writes `<path-prefix>.json` and `<path-prefix>.csv`
+- `--save-report` writes timestamped `.json` and `.csv` reports in the launch directory
 
 ## Default benchmark configuration
 
@@ -37,7 +37,11 @@ Scripted options:
 - File layout: single file.
 - Cache mode: enabled.
 - Keep files: disabled.
-- Save report: enabled.
+- Save report: disabled.
+
+Reports are saved only when `Save report` is enabled. JSON contains the
+benchmark settings, platform metadata, cache method, run metadata, pass
+summaries, and sample data. CSV is UTF-8 and contains one row per sample.
 - Execution: run once.
 - Throughput unit: MB/s.
 

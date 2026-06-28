@@ -11,15 +11,17 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
     BenchmarkConfig, BenchmarkPassReport, BenchmarkRunner, BenchmarkRunnerReport, CacheMode,
-    DiskTestMode, ExecutionMode, FileLayout, RunMode, StreamingIoSample, TerminalUi, UiAction,
-    Workload, WorkloadSize,
+    DiskTestMode, ExecutionMode, FileLayout, RunMode, StreamingIoPhase, StreamingIoSample,
+    TerminalUi, UiAction, Workload, WorkloadSize,
 };
+
+static REPORT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() -> io::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -62,8 +64,19 @@ fn run_scripted(args: &[String]) -> Result<(), String> {
             .map_err(|error| error.to_string())?
     };
 
-    if let Some(path) = &options.report_path {
-        save_reports(path, &options.config, options.workload_bytes, &report)?;
+    if options.config.save_report {
+        let launch_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let paths = save_reports(
+            &launch_dir,
+            &options.config,
+            options.workload_bytes,
+            &report,
+        )?;
+        println!(
+            "Reports saved - {}, {}",
+            paths.json.display(),
+            paths.csv.display()
+        );
     }
 
     println!("Done - {} passes", report.passes.len());
@@ -73,7 +86,6 @@ fn run_scripted(args: &[String]) -> Result<(), String> {
 struct ScriptedOptions {
     config: BenchmarkConfig,
     workload_bytes: Option<u64>,
-    report_path: Option<PathBuf>,
 }
 
 impl ScriptedOptions {
@@ -81,14 +93,13 @@ impl ScriptedOptions {
         let mut config = BenchmarkConfig::for_target(PathBuf::from("."));
         config.save_report = false;
         let mut workload_bytes = None;
-        let mut report_path = None;
         let mut args = args.iter().map(String::as_str);
 
         while let Some(arg) = args.next() {
             match arg {
                 "--target" => config.target_path = PathBuf::from(next_arg(&mut args)?),
                 "--workload-gb" => {
-                    config.workload_size = WorkloadSize::CustomGb(parse_u64(next_arg(&mut args)?)?)
+                    config.workload_size = WorkloadSize::CustomGb(parse_u64(next_arg(&mut args)?)?);
                 }
                 "--workload-bytes" => workload_bytes = Some(parse_u64(next_arg(&mut args)?)?),
                 "--run-mode" => config.run_mode = parse_run_mode(next_arg(&mut args)?)?,
@@ -96,16 +107,15 @@ impl ScriptedOptions {
                 "--layout" => config.file_layout = parse_layout(next_arg(&mut args)?)?,
                 "--file-size-mb" => {
                     config.file_layout =
-                        FileLayout::FixedFileSizeMb(parse_u64(next_arg(&mut args)?)?)
+                        FileLayout::FixedFileSizeMb(parse_u64(next_arg(&mut args)?)?);
                 }
                 "--cache" => config.cache_mode = parse_cache_mode(next_arg(&mut args)?)?,
                 "--execution" => {
-                    config.execution_mode = parse_execution_mode(next_arg(&mut args)?)?
+                    config.execution_mode = parse_execution_mode(next_arg(&mut args)?)?;
                 }
                 "--keep-files" => config.keep_files = true,
                 "--save-report" => {
                     config.save_report = true;
-                    report_path = Some(PathBuf::from(next_arg(&mut args)?));
                 }
                 value => return Err(format!("unknown argument: {value}")),
             }
@@ -120,7 +130,6 @@ impl ScriptedOptions {
         Ok(Self {
             config,
             workload_bytes,
-            report_path,
         })
     }
 }
@@ -178,65 +187,145 @@ fn parse_execution_mode(value: &str) -> Result<ExecutionMode, String> {
 }
 
 fn save_reports(
-    path: &std::path::Path,
+    launch_dir: &std::path::Path,
     config: &BenchmarkConfig,
     workload_bytes: Option<u64>,
     report: &BenchmarkRunnerReport,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create report directory {}: {error}",
-                parent.display()
-            )
-        })?;
+) -> Result<SavedReportPaths, String> {
+    if report.passes.is_empty() {
+        return Err(String::from("no completed pass data; report was not saved"));
     }
-    let json_path = path.with_extension("json");
-    let csv_path = path.with_extension("csv");
+
+    std::fs::create_dir_all(launch_dir).map_err(|error| {
+        format!(
+            "failed to create report directory {}: {error}",
+            launch_dir.display()
+        )
+    })?;
+    let prefix = next_report_path_prefix(launch_dir);
+    let json_path = prefix.with_extension("json");
+    let csv_path = prefix.with_extension("csv");
     let payload = serde_json::json!({
+        "run": {
+            "workload_bytes": workload_bytes,
+            "run_dir": report.run_dir,
+            "files_kept": report.files_kept,
+            "stopped": report.stopped,
+            "cleanup_error": report.cleanup_error,
+        },
+        "platform": {
+            "os": env::consts::OS,
+            "arch": env::consts::ARCH,
+        },
         "config": config,
-        "workload_bytes": workload_bytes,
-        "report": report,
+        "cache_method": cache_method_label(config.cache_mode),
+        "passes": report.passes,
     });
     let json = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
-    std::fs::write(&json_path, json).map_err(|error| {
+    write_new(&json_path, &json).map_err(|error| {
         format!(
             "failed to write JSON report to {}: {error}",
             json_path.display()
         )
     })?;
-    std::fs::write(&csv_path, passes_csv(&report.passes)).map_err(|error| {
+    write_new(&csv_path, passes_csv(&report.passes).as_bytes()).map_err(|error| {
         format!(
             "failed to write CSV report to {}: {error}",
             csv_path.display()
         )
     })?;
-    Ok(())
+    Ok(SavedReportPaths {
+        json: json_path,
+        csv: csv_path,
+    })
+}
+
+#[derive(Debug)]
+struct SavedReportPaths {
+    json: PathBuf,
+    csv: PathBuf,
+}
+
+fn next_report_path_prefix(launch_dir: &std::path::Path) -> PathBuf {
+    loop {
+        let counter = REPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix = report_path_prefix(launch_dir, SystemTime::now(), counter);
+        if !prefix.with_extension("json").exists() && !prefix.with_extension("csv").exists() {
+            return prefix;
+        }
+    }
+}
+
+fn report_path_prefix(
+    launch_dir: &std::path::Path,
+    timestamp: SystemTime,
+    counter: u64,
+) -> PathBuf {
+    let seconds = timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    launch_dir.join(format!("studiofs-bench-report-{seconds}-{counter}"))
+}
+
+fn write_new(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, bytes)
 }
 
 fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
-    let mut csv = String::from(
-        "phase,pass_number,bytes_processed,stopped,sample_count,average_mb_per_second,stable_mb_per_second,minimum_mb_per_second,drop_count\n",
-    );
+    let mut csv = String::from("phase,pass_number,sample_index,mb_per_second\n");
     for pass in passes {
-        writeln!(
-            csv,
-            "{:?},{},{},{},{},{},{},{},{}",
-            pass.phase,
-            pass.pass_number,
-            pass.bytes_processed,
-            pass.stopped,
-            pass.metrics.sample_count,
-            pass.metrics.average_mb_per_second,
-            pass.metrics.stable_mb_per_second,
-            pass.metrics.minimum_mb_per_second,
-            pass.metrics.drop_count
-        )
-        .expect("writing CSV into a String should not fail");
+        for (sample_index, mb_per_second) in pass.throughput_samples.iter().enumerate() {
+            writeln!(
+                csv,
+                "{},{},{},{}",
+                phase_csv(pass.phase),
+                pass.pass_number,
+                sample_index,
+                mb_per_second
+            )
+            .expect("writing CSV into a String should not fail");
+        }
     }
     csv
+}
+
+fn phase_csv(phase: StreamingIoPhase) -> &'static str {
+    match phase {
+        StreamingIoPhase::Write => "write",
+        StreamingIoPhase::Read => "read",
+    }
+}
+
+fn cache_method_label(cache_mode: CacheMode) -> &'static str {
+    match cache_mode {
+        CacheMode::Enabled => "normal_file_io",
+        CacheMode::Disabled => disabled_cache_method_label(),
+    }
+}
+
+#[cfg(windows)]
+fn disabled_cache_method_label() -> &'static str {
+    "write_through"
+}
+
+#[cfg(target_os = "macos")]
+fn disabled_cache_method_label() -> &'static str {
+    "fcntl_no_cache"
+}
+
+#[cfg(target_os = "linux")]
+fn disabled_cache_method_label() -> &'static str {
+    "posix_fadvise_dont_need"
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn disabled_cache_method_label() -> &'static str {
+    "best_effort_unavailable"
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
@@ -332,7 +421,14 @@ fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
                 },
                 || should_stop.load(Ordering::Relaxed),
             )
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string())
+            .and_then(|report| {
+                if config.save_report {
+                    let launch_dir = env::current_dir().map_err(|error| error.to_string())?;
+                    save_reports(&launch_dir, &config, None, &report)?;
+                }
+                Ok(report)
+            });
         let _ = done_tx.send(result);
     });
 
@@ -389,7 +485,7 @@ fn stop_running(running: Option<RunningBenchmark>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_bench::StreamingIoPhase;
+    use studiofs_bench::{BenchmarkPassMetrics, StreamingIoPhase};
 
     fn stopped_report() -> BenchmarkRunnerReport {
         BenchmarkRunnerReport {
@@ -547,9 +643,8 @@ mod tests {
     fn scripted_options_reject_continuous_execution() {
         let args = ["--execution", "continuous"].map(String::from);
 
-        let error = match ScriptedOptions::parse(&args) {
-            Ok(_) => panic!("continuous execution should be rejected"),
-            Err(error) => error,
+        let Err(error) = ScriptedOptions::parse(&args) else {
+            panic!("continuous execution should be rejected");
         };
 
         assert_eq!(error, "scripted mode does not support continuous execution");
@@ -572,7 +667,6 @@ mod tests {
             "disabled",
             "--keep-files",
             "--save-report",
-            "E:/reports/bench",
         ]
         .map(String::from);
 
@@ -592,16 +686,88 @@ mod tests {
         assert_eq!(options.config.cache_mode, CacheMode::Disabled);
         assert!(options.config.keep_files);
         assert!(options.config.save_report);
-        assert_eq!(options.report_path, Some(PathBuf::from("E:/reports/bench")));
+    }
+
+    #[test]
+    fn report_path_prefix_uses_launch_dir_timestamp_and_counter() {
+        let dir = PathBuf::from("E:/reports");
+        let first = report_path_prefix(
+            &dir,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            0,
+        );
+        let second = report_path_prefix(
+            &dir,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            1,
+        );
+
+        assert_eq!(first, dir.join("studiofs-bench-report-1700000000-0"));
+        assert_eq!(second, dir.join("studiofs-bench-report-1700000000-1"));
+    }
+
+    #[test]
+    fn save_reports_rejects_empty_pass_data() {
+        let report = stopped_report();
+        let config = BenchmarkConfig::for_target(PathBuf::from("."));
+        let dir = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-577-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let error = save_reports(&dir, &config, None, &report).unwrap_err();
+
+        assert_eq!(error, "no completed pass data; report was not saved");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_reports_writes_json_context_and_csv_samples() {
+        let dir = std::env::temp_dir().join(format!(
+            "studiofs-bench-sfs-577-report-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
+        config.test_mode = DiskTestMode::WriteOnly;
+        let report = BenchmarkRunnerReport {
+            run_dir: "E:/bench-target/studiofs-bench-run".into(),
+            files_kept: false,
+            cleanup_error: None,
+            passes: vec![BenchmarkPassReport {
+                phase: StreamingIoPhase::Write,
+                pass_number: 1,
+                bytes_processed: 8,
+                stopped: false,
+                metrics: BenchmarkPassMetrics::default(),
+                throughput_samples: vec![10.0, 20.0],
+            }],
+            stopped: false,
+        };
+
+        let paths = save_reports(&dir, &config, Some(8), &report).unwrap();
+
+        let json = std::fs::read_to_string(paths.json).unwrap();
+        let csv = std::fs::read_to_string(paths.csv).unwrap();
+        assert!(json.contains("\"platform\""));
+        assert!(json.contains("\"cache_method\""));
+        assert!(json.contains("\"file_layout\""));
+        assert!(csv.contains("phase,pass_number,sample_index,mb_per_second"));
+        assert!(csv.contains("write,1,0,10"));
+        assert!(csv.contains("write,1,1,20"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn scripted_options_reject_missing_argument_value() {
         let args = ["--target"].map(String::from);
 
-        let error = match ScriptedOptions::parse(&args) {
-            Ok(_) => panic!("missing argument value should be rejected"),
-            Err(error) => error,
+        let Err(error) = ScriptedOptions::parse(&args) else {
+            panic!("missing argument value should be rejected");
         };
 
         assert_eq!(error, "missing argument value");
@@ -611,9 +777,8 @@ mod tests {
     fn scripted_options_reject_invalid_number() {
         let args = ["--workload-bytes", "nope"].map(String::from);
 
-        let error = match ScriptedOptions::parse(&args) {
-            Ok(_) => panic!("invalid number should be rejected"),
-            Err(error) => error,
+        let Err(error) = ScriptedOptions::parse(&args) else {
+            panic!("invalid number should be rejected");
         };
 
         assert_eq!(error, "invalid unsigned integer: nope");

@@ -542,7 +542,7 @@ impl BenchmarkConfig {
             file_layout: FileLayout::SingleFile,
             cache_mode: CacheMode::Enabled,
             keep_files: false,
-            save_report: true,
+            save_report: false,
             execution_mode: ExecutionMode::RunOnce,
         }
     }

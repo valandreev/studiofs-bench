@@ -19,11 +19,11 @@ fn binary_prints_name() {
 #[test]
 fn scripted_mode_runs_tiny_benchmark_and_saves_reports() {
     let dir = TestDir::new("studiofs-bench-sfs-578-scripted");
-    let report = dir.path().join("reports").join("report");
+    let target = dir.path().join("bench-target");
 
     let output = Command::new(env!("CARGO_BIN_EXE_studiofs-bench"))
         .arg("--target")
-        .arg(dir.path())
+        .arg(&target)
         .arg("--scripted")
         .arg("--workload-bytes")
         .arg("8")
@@ -34,15 +34,29 @@ fn scripted_mode_runs_tiny_benchmark_and_saves_reports() {
         .arg("--cache")
         .arg("enabled")
         .arg("--save-report")
-        .arg(&report)
+        .current_dir(dir.path())
         .output()
         .expect("run scripted studiofs-bench");
 
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Done - 1 passes"));
     assert!(output.stderr.is_empty());
-    assert!(report.with_extension("json").exists());
-    assert!(report.with_extension("csv").exists());
+    assert_eq!(report_count(dir.path(), "json"), 1);
+    assert_eq!(report_count(dir.path(), "csv"), 1);
+}
+
+fn report_count(dir: &std::path::Path, extension: &str) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("studiofs-bench-report-")
+        })
+        .count()
 }
 
 struct TestDir {
