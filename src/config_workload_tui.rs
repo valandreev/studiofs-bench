@@ -13,7 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
 };
 use serde::Serialize;
-use thiserror::Error;
 
 use crate::runner_streaming::{MetricsAccumulator, chunk_len, fill_benchmark_buffer};
 use crate::{BenchmarkPassReport, StreamingIoPhase, StreamingIoSample};
@@ -950,151 +949,16 @@ pub enum ExecutionMode {
     Continuous,
 }
 
-fn workload_size_label(value: WorkloadSize) -> &'static str {
-    match value {
-        WorkloadSize::Preset(WorkloadPreset::OneGb) => "1 GB",
-        WorkloadSize::Preset(WorkloadPreset::FourGb) => "4 GB",
-        WorkloadSize::Preset(WorkloadPreset::SixteenGb) => "16 GB",
-        WorkloadSize::Preset(WorkloadPreset::SixtyFourGb) => "64 GB",
-        WorkloadSize::CustomGb(_) => "custom",
-    }
-}
+mod errors;
+mod labels;
 
-fn next_workload_size(value: WorkloadSize, next: bool) -> WorkloadSize {
-    const VALUES: [WorkloadSize; 4] = [
-        WorkloadSize::Preset(WorkloadPreset::OneGb),
-        WorkloadSize::Preset(WorkloadPreset::FourGb),
-        WorkloadSize::Preset(WorkloadPreset::SixteenGb),
-        WorkloadSize::Preset(WorkloadPreset::SixtyFourGb),
-    ];
-    cycle(value, &VALUES, next)
-}
+pub use errors::{ConfigError, WorkloadError};
 
-fn test_mode_label(value: DiskTestMode) -> &'static str {
-    match value {
-        DiskTestMode::ReadWrite => "read/write",
-        DiskTestMode::WriteOnly => "write only",
-        DiskTestMode::WriteOnceReadLoop => "write once, read loop",
-    }
-}
-
-fn next_test_mode(value: DiskTestMode, next: bool) -> DiskTestMode {
-    const VALUES: [DiskTestMode; 3] = [
-        DiskTestMode::ReadWrite,
-        DiskTestMode::WriteOnly,
-        DiskTestMode::WriteOnceReadLoop,
-    ];
-    cycle(value, &VALUES, next)
-}
-
-fn file_layout_label(value: FileLayout) -> &'static str {
-    match value {
-        FileLayout::SingleFile => "single file",
-        FileLayout::HundredFilesPlusMinusFive => "100 files +/-5%",
-        FileLayout::FixedFileSizeMb(_) => "fixed file size",
-    }
-}
-
-fn next_file_layout(value: FileLayout, next: bool) -> FileLayout {
-    const VALUES: [FileLayout; 2] = [
-        FileLayout::SingleFile,
-        FileLayout::HundredFilesPlusMinusFive,
-    ];
-    cycle(value, &VALUES, next)
-}
-
-fn cache_mode_label(value: CacheMode) -> &'static str {
-    match value {
-        CacheMode::Enabled => "enabled",
-        CacheMode::Disabled => "disabled",
-    }
-}
-
-fn next_cache_mode(value: CacheMode) -> CacheMode {
-    match value {
-        CacheMode::Enabled => CacheMode::Disabled,
-        CacheMode::Disabled => CacheMode::Enabled,
-    }
-}
-
-fn execution_mode_label(value: ExecutionMode) -> &'static str {
-    match value {
-        ExecutionMode::RunOnce => "run once",
-        ExecutionMode::Continuous => "continuous",
-    }
-}
-
-fn next_execution_mode(value: ExecutionMode) -> ExecutionMode {
-    match value {
-        ExecutionMode::RunOnce => ExecutionMode::Continuous,
-        ExecutionMode::Continuous => ExecutionMode::RunOnce,
-    }
-}
-
-fn bool_label(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
-}
-
-fn cycle<T: Copy + PartialEq>(value: T, values: &[T], next: bool) -> T {
-    assert!(!values.is_empty(), "cannot cycle through an empty slice");
-    let index = values.iter().position(|item| *item == value).unwrap_or(0);
-    let index = if next {
-        (index + 1) % values.len()
-    } else {
-        (index + values.len() - 1) % values.len()
-    };
-    values[index]
-}
-
-/// User-facing configuration validation error.
-#[derive(Debug, Copy, Clone, Error, PartialEq, Eq)]
-pub enum ConfigError {
-    /// The target path is empty.
-    #[error("target path must not be empty")]
-    EmptyTargetPath,
-    /// The workload size is zero.
-    #[error("workload size must be greater than zero")]
-    ZeroWorkload,
-    /// The fixed file size is zero.
-    #[error("file layout size must be greater than zero")]
-    ZeroFileSize,
-    /// The fixed file size is larger than the total workload.
-    #[error("file layout size must not exceed total workload size")]
-    FileLayoutExceedsWorkload,
-    /// The workload size is too large for decimal byte representation.
-    #[error("workload size is too large")]
-    WorkloadOverflow,
-}
-
-/// Workload generation error.
-#[derive(Debug, Error)]
-pub enum WorkloadError {
-    /// Benchmark configuration is invalid for workload generation.
-    #[error("{0}")]
-    Config(#[from] ConfigError),
-    /// The requested total size cannot produce non-empty files for the layout.
-    #[error("workload size is too small for the selected file layout")]
-    WorkloadTooSmallForLayout,
-    /// Filesystem I/O failed.
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-    /// Filesystem I/O failed for a benchmark path.
-    #[error("I/O failed for {}: {source}", path.display())]
-    PathIo {
-        /// Path involved in the failed operation.
-        path: PathBuf,
-        /// Source I/O error.
-        #[source]
-        source: io::Error,
-    },
-}
-
-fn phase_label(phase: StreamingIoPhase) -> &'static str {
-    match phase {
-        StreamingIoPhase::Write => "write",
-        StreamingIoPhase::Read => "read",
-    }
-}
+use labels::{
+    bool_label, cache_mode_label, execution_mode_label, file_layout_label, next_cache_mode,
+    next_execution_mode, next_file_layout, next_test_mode, next_workload_size, phase_label,
+    test_mode_label, workload_size_label,
+};
 
 #[cfg(test)]
 mod tests;
