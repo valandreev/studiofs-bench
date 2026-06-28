@@ -93,19 +93,30 @@ fn finish_scripted_error(
     if let BenchmarkRunnerError::RunFailed { partial_report, .. } = error
         && options.config.save_report
     {
-        let launch_dir = env::current_dir()
-            .map_err(|error| format!("failed to read launch directory: {error}"))?;
-        let paths = save_reports(
-            &launch_dir,
-            &options.config,
-            options.workload_bytes,
-            partial_report,
-        )?;
-        println!(
-            "Reports saved - {}, {}",
-            paths.json.display(),
-            paths.csv.display()
-        );
+        match env::current_dir() {
+            Ok(launch_dir) => {
+                match save_reports(
+                    &launch_dir,
+                    &options.config,
+                    options.workload_bytes,
+                    partial_report,
+                ) {
+                    Ok(paths) => {
+                        println!(
+                            "Reports saved - {}, {}",
+                            paths.json.display(),
+                            paths.csv.display()
+                        );
+                    }
+                    Err(save_error) => {
+                        eprintln!("Warning - failed to save partial report: {save_error}");
+                    }
+                }
+            }
+            Err(current_dir_error) => {
+                eprintln!("Warning - failed to read launch directory: {current_dir_error}");
+            }
+        }
     }
 
     Err(error.to_string())
@@ -506,6 +517,7 @@ struct RunningBenchmark {
 struct BenchmarkRunError {
     message: String,
     passes: Vec<BenchmarkPassReport>,
+    cleanup_error: Option<String>,
 }
 
 impl BenchmarkRunError {
@@ -513,12 +525,21 @@ impl BenchmarkRunError {
         let message = error.to_string();
         match error {
             BenchmarkRunnerError::RunFailed { partial_report, .. } => {
-                let BenchmarkRunnerReport { passes, .. } = *partial_report;
-                Self { message, passes }
+                let BenchmarkRunnerReport {
+                    passes,
+                    cleanup_error,
+                    ..
+                } = *partial_report;
+                Self {
+                    message,
+                    passes,
+                    cleanup_error,
+                }
             }
             _ => Self {
                 message,
                 passes: Vec::new(),
+                cleanup_error: None,
             },
         }
     }
@@ -527,6 +548,7 @@ impl BenchmarkRunError {
         Self {
             message,
             passes: report.passes,
+            cleanup_error: report.cleanup_error,
         }
     }
 
@@ -535,8 +557,18 @@ impl BenchmarkRunError {
         Self {
             message: message.into(),
             passes: Vec::new(),
+            cleanup_error: None,
         }
     }
+}
+
+fn append_cleanup_error(mut message: String, cleanup_error: Option<&str>) -> String {
+    if let Some(cleanup_error) = cleanup_error {
+        message.insert_str(0, "; ");
+        message.insert_str(0, cleanup_error);
+        message.insert_str(0, "Cleanup Failed: ");
+    }
+    message
 }
 
 fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
@@ -597,13 +629,22 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
                     } else {
                         format!("Done - {} passes", report.passes.len())
                     };
+                    let message = append_cleanup_error(message, report.cleanup_error.as_deref());
                     ui.finish_run_with_passes(message, report.passes);
                 }
                 Err(error) if error.passes.is_empty() => {
-                    ui.finish_run(format!("Error - {}", error.message));
+                    let message = append_cleanup_error(
+                        format!("Error - {}", error.message),
+                        error.cleanup_error.as_deref(),
+                    );
+                    ui.finish_run(message);
                 }
                 Err(error) => {
-                    ui.finish_run_with_passes(format!("Error - {}", error.message), error.passes);
+                    let message = append_cleanup_error(
+                        format!("Error - {}", error.message),
+                        error.cleanup_error.as_deref(),
+                    );
+                    ui.finish_run_with_passes(message, error.passes);
                 }
             }
             *running = None;
@@ -649,6 +690,29 @@ mod tests {
             cleanup_error: None,
             passes: Vec::new(),
             stopped: true,
+        }
+    }
+
+    fn one_pass_report(cleanup_error: Option<String>) -> BenchmarkRunnerReport {
+        BenchmarkRunnerReport {
+            run_dir: ".".into(),
+            files_kept: false,
+            cleanup_error,
+            passes: vec![BenchmarkPassReport {
+                phase: StreamingIoPhase::Write,
+                pass_number: 1,
+                bytes_processed: 1,
+                stopped: false,
+                metrics: BenchmarkPassMetrics {
+                    sample_count: 1,
+                    average_mb_per_second: 123.0,
+                    stable_mb_per_second: 123.0,
+                    minimum_mb_per_second: 123.0,
+                    drop_count: 0,
+                },
+                throughput_samples: Vec::new(),
+            }],
+            stopped: false,
         }
     }
 
@@ -785,26 +849,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (_sample_tx, samples) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
-        let report = BenchmarkRunnerReport {
-            run_dir: ".".into(),
-            files_kept: false,
-            cleanup_error: None,
-            passes: vec![BenchmarkPassReport {
-                phase: StreamingIoPhase::Write,
-                pass_number: 1,
-                bytes_processed: 1,
-                stopped: false,
-                metrics: BenchmarkPassMetrics {
-                    sample_count: 1,
-                    average_mb_per_second: 123.0,
-                    stable_mb_per_second: 123.0,
-                    minimum_mb_per_second: 123.0,
-                    drop_count: 0,
-                },
-                throughput_samples: Vec::new(),
-            }],
-            stopped: false,
-        };
+        let report = one_pass_report(None);
         done_tx
             .send(Err(BenchmarkRunError::from_runner(
                 BenchmarkRunnerError::RunFailed {
@@ -824,6 +869,51 @@ mod tests {
         assert!(changed);
         assert_render_contains(&ui, "write pass 1: Avg 123.0");
         assert_render_contains(&ui, "Error - benchmark failed after 1 completed passes");
+    }
+
+    #[test]
+    fn finish_completed_run_shows_cleanup_error_from_run_failed_report() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let report = one_pass_report(Some(String::from("cleanup failed")));
+        done_tx
+            .send(Err(BenchmarkRunError::from_runner(
+                BenchmarkRunnerError::RunFailed {
+                    source: Box::new(BenchmarkRunnerError::Config(ConfigError::ZeroWorkload)),
+                    partial_report: Box::new(report),
+                },
+            )))
+            .unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert_render_contains(&ui, "Cleanup Failed");
+    }
+
+    #[test]
+    fn finish_scripted_error_keeps_primary_error_when_partial_report_save_fails() {
+        let mut options = ScriptedOptions {
+            config: BenchmarkConfig::for_target(PathBuf::from(".")),
+            workload_bytes: None,
+        };
+        options.config.save_report = true;
+        let error = BenchmarkRunnerError::RunFailed {
+            source: Box::new(BenchmarkRunnerError::Config(ConfigError::ZeroWorkload)),
+            partial_report: Box::new(stopped_report()),
+        };
+
+        let result = finish_scripted_error(&error, &options).unwrap_err();
+
+        assert_eq!(result, error.to_string());
     }
 
     #[test]
