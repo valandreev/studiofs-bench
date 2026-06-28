@@ -2,6 +2,7 @@
 
 use std::{
     env,
+    fmt::Write as _,
     io::{self, IsTerminal},
     path::PathBuf,
     sync::{
@@ -76,37 +77,39 @@ impl ScriptedOptions {
         config.save_report = false;
         let mut workload_bytes = None;
         let mut report_path = None;
-        let mut index = 0;
+        let mut args = args.iter().map(String::as_str);
 
-        while index < args.len() {
-            match args[index].as_str() {
-                "--target" => config.target_path = PathBuf::from(value_after(args, &mut index)?),
+        while let Some(arg) = args.next() {
+            match arg {
+                "--target" => config.target_path = PathBuf::from(next_arg(&mut args)?),
                 "--workload-gb" => {
-                    config.workload_size =
-                        WorkloadSize::CustomGb(parse_u64(value_after(args, &mut index)?)?)
+                    config.workload_size = WorkloadSize::CustomGb(parse_u64(next_arg(&mut args)?)?)
                 }
-                "--workload-bytes" => {
-                    workload_bytes = Some(parse_u64(value_after(args, &mut index)?)?)
-                }
-                "--run-mode" => config.run_mode = parse_run_mode(value_after(args, &mut index)?)?,
-                "--mode" => config.test_mode = parse_test_mode(value_after(args, &mut index)?)?,
-                "--layout" => config.file_layout = parse_layout(value_after(args, &mut index)?)?,
+                "--workload-bytes" => workload_bytes = Some(parse_u64(next_arg(&mut args)?)?),
+                "--run-mode" => config.run_mode = parse_run_mode(next_arg(&mut args)?)?,
+                "--mode" => config.test_mode = parse_test_mode(next_arg(&mut args)?)?,
+                "--layout" => config.file_layout = parse_layout(next_arg(&mut args)?)?,
                 "--file-size-mb" => {
                     config.file_layout =
-                        FileLayout::FixedFileSizeMb(parse_u64(value_after(args, &mut index)?)?)
+                        FileLayout::FixedFileSizeMb(parse_u64(next_arg(&mut args)?)?)
                 }
-                "--cache" => config.cache_mode = parse_cache_mode(value_after(args, &mut index)?)?,
+                "--cache" => config.cache_mode = parse_cache_mode(next_arg(&mut args)?)?,
                 "--execution" => {
-                    config.execution_mode = parse_execution_mode(value_after(args, &mut index)?)?
+                    config.execution_mode = parse_execution_mode(next_arg(&mut args)?)?
                 }
                 "--keep-files" => config.keep_files = true,
                 "--save-report" => {
                     config.save_report = true;
-                    report_path = Some(PathBuf::from(value_after(args, &mut index)?));
+                    report_path = Some(PathBuf::from(next_arg(&mut args)?));
                 }
                 value => return Err(format!("unknown argument: {value}")),
             }
-            index += 1;
+        }
+
+        if config.execution_mode == ExecutionMode::Continuous {
+            return Err(String::from(
+                "scripted mode does not support continuous execution",
+            ));
         }
 
         Ok(Self {
@@ -117,29 +120,27 @@ impl ScriptedOptions {
     }
 }
 
-fn value_after(args: &[String], index: &mut usize) -> Result<String, String> {
-    *index += 1;
-    args.get(*index)
-        .cloned()
+fn next_arg<'a>(args: &mut impl Iterator<Item = &'a str>) -> Result<&'a str, String> {
+    args.next()
         .ok_or_else(|| String::from("missing argument value"))
 }
 
-fn parse_u64(value: String) -> Result<u64, String> {
+fn parse_u64(value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("invalid unsigned integer: {value}"))
 }
 
-fn parse_run_mode(value: String) -> Result<RunMode, String> {
-    match value.as_str() {
+fn parse_run_mode(value: &str) -> Result<RunMode, String> {
+    match value {
         "local" | "local-filesystem" => Ok(RunMode::LocalFilesystem),
         "mounted" | "mounted-filesystem" => Ok(RunMode::MountedFilesystem),
         _ => Err(format!("invalid run mode: {value}")),
     }
 }
 
-fn parse_test_mode(value: String) -> Result<DiskTestMode, String> {
-    match value.as_str() {
+fn parse_test_mode(value: &str) -> Result<DiskTestMode, String> {
+    match value {
         "read-write" => Ok(DiskTestMode::ReadWrite),
         "write-only" => Ok(DiskTestMode::WriteOnly),
         "write-once-read-loop" => Ok(DiskTestMode::WriteOnceReadLoop),
@@ -147,24 +148,24 @@ fn parse_test_mode(value: String) -> Result<DiskTestMode, String> {
     }
 }
 
-fn parse_layout(value: String) -> Result<FileLayout, String> {
-    match value.as_str() {
+fn parse_layout(value: &str) -> Result<FileLayout, String> {
+    match value {
         "single-file" => Ok(FileLayout::SingleFile),
         "hundred-files-plus-minus-five" => Ok(FileLayout::HundredFilesPlusMinusFive),
         _ => Err(format!("invalid layout: {value}")),
     }
 }
 
-fn parse_cache_mode(value: String) -> Result<CacheMode, String> {
-    match value.as_str() {
+fn parse_cache_mode(value: &str) -> Result<CacheMode, String> {
+    match value {
         "enabled" => Ok(CacheMode::Enabled),
         "disabled" => Ok(CacheMode::Disabled),
         _ => Err(format!("invalid cache mode: {value}")),
     }
 }
 
-fn parse_execution_mode(value: String) -> Result<ExecutionMode, String> {
-    match value.as_str() {
+fn parse_execution_mode(value: &str) -> Result<ExecutionMode, String> {
+    match value {
         "run-once" => Ok(ExecutionMode::RunOnce),
         "continuous" => Ok(ExecutionMode::Continuous),
         _ => Err(format!("invalid execution mode: {value}")),
@@ -195,8 +196,9 @@ fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
         "phase,pass_number,bytes_processed,stopped,sample_count,average_mb_per_second,stable_mb_per_second,minimum_mb_per_second,drop_count\n",
     );
     for pass in passes {
-        csv.push_str(&format!(
-            "{:?},{},{},{},{},{},{},{},{}\n",
+        let _ = writeln!(
+            csv,
+            "{:?},{},{},{},{},{},{},{},{}",
             pass.phase,
             pass.pass_number,
             pass.bytes_processed,
@@ -206,7 +208,7 @@ fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
             pass.metrics.stable_mb_per_second,
             pass.metrics.minimum_mb_per_second,
             pass.metrics.drop_count
-        ));
+        );
     }
     csv
 }
@@ -513,6 +515,18 @@ mod tests {
         assert!(completed);
         assert!(stop.load(Ordering::Relaxed));
         assert!(running.is_none());
+    }
+
+    #[test]
+    fn scripted_options_reject_continuous_execution() {
+        let args = ["--execution", "continuous"].map(String::from);
+
+        let error = match ScriptedOptions::parse(&args) {
+            Ok(_) => panic!("continuous execution should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "scripted mode does not support continuous execution");
     }
 
     fn assert_render_contains(ui: &TerminalUi, expected: &str) {

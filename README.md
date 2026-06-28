@@ -25,7 +25,7 @@ Scripted options:
 - `--layout single-file|hundred-files-plus-minus-five`
 - `--file-size-mb <n>`
 - `--cache enabled|disabled`
-- `--execution run-once|continuous`
+- `--execution run-once`
 - `--keep-files`
 - `--save-report <path-prefix>` writes `<path-prefix>.json` and `<path-prefix>.csv`
 

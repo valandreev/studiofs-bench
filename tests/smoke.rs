@@ -1,6 +1,9 @@
 //! Binary smoke tests.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn binary_prints_name() {
@@ -48,7 +51,8 @@ struct TestDir {
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{name}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
