@@ -3,7 +3,7 @@
 use std::{
     env,
     fs::File,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -216,8 +216,16 @@ fn save_reports(
     let files = create_report_files(launch_dir)?;
     write_report_files(
         files,
-        |json_file| serde_json::to_writer_pretty(json_file, &payload).map_err(io::Error::other),
-        |csv_file| write_passes_csv(csv_file, &report.passes),
+        |json_file| {
+            let mut writer = io::BufWriter::new(json_file);
+            serde_json::to_writer_pretty(&mut writer, &payload).map_err(io::Error::other)?;
+            writer.flush()
+        },
+        |csv_file| {
+            let mut writer = io::BufWriter::new(csv_file);
+            write_passes_csv(&mut writer, &report.passes)?;
+            writer.flush()
+        },
     )
 }
 
@@ -335,14 +343,7 @@ fn cleanup_report_files(paths: &SavedReportPaths) {
 }
 
 fn remove_report_file(path: &std::path::Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => eprintln!(
-            "failed to remove partial report {}: {error}",
-            path.display()
-        ),
-    }
+    let _ = std::fs::remove_file(path);
 }
 
 fn write_passes_csv(output: &mut impl io::Write, passes: &[BenchmarkPassReport]) -> io::Result<()> {
@@ -553,7 +554,7 @@ fn stop_running(running: Option<RunningBenchmark>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write as _, sync::atomic::AtomicU64};
+    use std::sync::atomic::AtomicU64;
 
     use studiofs_bench::{BenchmarkPassMetrics, StreamingIoPhase};
 
