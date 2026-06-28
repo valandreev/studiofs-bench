@@ -197,12 +197,6 @@ fn save_reports(
         return Err(String::from("no completed pass data; report was not saved"));
     }
 
-    std::fs::create_dir_all(launch_dir).map_err(|error| {
-        format!(
-            "failed to create report directory {}: {error}",
-            launch_dir.display()
-        )
-    })?;
     let payload = serde_json::json!({
         "run": {
             "workload_bytes": workload_bytes,
@@ -258,11 +252,13 @@ fn create_report_files(launch_dir: &std::path::Path) -> Result<OpenedReportFiles
         let csv = match create_new_file(&csv_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&json_path);
+                drop(json);
+                remove_report_file(&json_path);
                 continue;
             }
             Err(error) => {
-                let _ = std::fs::remove_file(&json_path);
+                drop(json);
+                remove_report_file(&json_path);
                 return Err(format!(
                     "failed to create CSV report {}: {error}",
                     csv_path.display()
@@ -301,31 +297,52 @@ fn create_new_file(path: &std::path::Path) -> io::Result<File> {
 }
 
 fn write_report_files(
-    mut files: OpenedReportFiles,
+    files: OpenedReportFiles,
     write_json: impl FnOnce(&mut File) -> io::Result<()>,
     write_csv: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> Result<SavedReportPaths, String> {
-    if let Err(error) = write_json(&mut files.json) {
-        cleanup_report_files(&files.paths);
+    let OpenedReportFiles {
+        paths,
+        mut json,
+        mut csv,
+    } = files;
+
+    if let Err(error) = write_json(&mut json) {
+        drop(json);
+        drop(csv);
+        cleanup_report_files(&paths);
         return Err(format!(
             "failed to write JSON report to {}: {error}",
-            files.paths.json.display()
+            paths.json.display()
         ));
     }
-    if let Err(error) = write_csv(&mut files.csv) {
-        cleanup_report_files(&files.paths);
+    if let Err(error) = write_csv(&mut csv) {
+        drop(json);
+        drop(csv);
+        cleanup_report_files(&paths);
         return Err(format!(
             "failed to write CSV report to {}: {error}",
-            files.paths.csv.display()
+            paths.csv.display()
         ));
     }
 
-    Ok(files.paths)
+    Ok(paths)
 }
 
 fn cleanup_report_files(paths: &SavedReportPaths) {
-    let _ = std::fs::remove_file(&paths.json);
-    let _ = std::fs::remove_file(&paths.csv);
+    remove_report_file(&paths.json);
+    remove_report_file(&paths.csv);
+}
+
+fn remove_report_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "failed to remove partial report {}: {error}",
+            path.display()
+        ),
+    }
 }
 
 fn write_passes_csv(output: &mut impl io::Write, passes: &[BenchmarkPassReport]) -> io::Result<()> {

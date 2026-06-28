@@ -53,8 +53,8 @@ fn report_count(dir: &std::path::Path, extension: &str) -> usize {
             entry.path().extension().and_then(|value| value.to_str()) == Some(extension)
                 && entry
                     .file_name()
-                    .to_string_lossy()
-                    .starts_with("studiofs-bench-report-")
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("studiofs-bench-report-"))
         })
         .count()
 }
