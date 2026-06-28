@@ -448,23 +448,27 @@ fn append_pass_chart_rows(
     ]);
 }
 
-fn chart_points(samples: &[f64], width: usize) -> Vec<f64> {
+fn chart_points(samples: &[f64], width: usize) -> Cow<'_, [f64]> {
     if samples.len() <= width {
-        return samples.to_vec();
+        return Cow::Borrowed(samples);
     }
-    (0..width)
-        .map(|index| {
-            let sample_index = index * (samples.len() - 1) / (width - 1);
-            samples[sample_index]
-        })
-        .collect()
+    Cow::Owned(
+        (0..width)
+            .map(|index| {
+                let sample_index = index * (samples.len() - 1) / (width - 1);
+                samples[sample_index]
+            })
+            .collect(),
+    )
 }
 
 fn chart_row(label: f64, threshold: f64, samples: &[f64]) -> String {
     let mut row = format!("{label:>5.1} |");
-    for sample in samples {
-        row.push(if *sample >= threshold { '*' } else { ' ' });
-    }
+    row.extend(
+        samples
+            .iter()
+            .map(|sample| if *sample >= threshold { '*' } else { ' ' }),
+    );
     row
 }
 

@@ -185,9 +185,9 @@ impl BenchmarkRunner {
         let mut bytes_processed = 0;
         let mut stopped = false;
         let mut metrics = MetricsAccumulator::default();
-        let mut throughput_samples = Vec::new();
         let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
         let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
+        let mut throughput_samples = Vec::with_capacity(sample_capacity(files, buffer.len()));
         if phase == StreamingIoPhase::Write {
             fill_benchmark_buffer(&mut buffer);
         }
@@ -250,6 +250,20 @@ impl BenchmarkRunner {
             throughput_samples,
         })
     }
+}
+
+fn sample_capacity(files: &[WorkloadFile], block_size: usize) -> usize {
+    let Ok(block_size) = u64::try_from(block_size) else {
+        return usize::MAX;
+    };
+    if block_size == 0 {
+        return 0;
+    }
+
+    files.iter().fold(0, |capacity, file| {
+        let file_samples = usize::try_from(file.bytes.div_ceil(block_size)).unwrap_or(usize::MAX);
+        capacity.saturating_add(file_samples)
+    })
 }
 
 #[derive(Debug, Default)]
