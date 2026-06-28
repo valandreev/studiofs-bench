@@ -136,6 +136,22 @@ fn engine_skips_zero_byte_read_without_opening_file() {
 }
 
 #[test]
+fn engine_read_error_includes_missing_file_path() {
+    let dir = TestDir::new("studiofs-bench-sfs-579-missing-read");
+    let path = dir.path().join("missing.bin");
+
+    let error = StreamingIoEngine::with_block_size(4)
+        .unwrap()
+        .read_with_cache_mode(&path, 1, CacheMode::Enabled, 1, |_| {}, || false)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "missing path not reported in error: {error}"
+    );
+}
+
+#[test]
 fn engine_stamps_offsets_inside_large_chunks() {
     let dir = TestDir::new("studiofs-bench-sfs-571-sub-block-stamps");
     let path = dir.path().join("stream.bin");
