@@ -187,6 +187,7 @@ impl BenchmarkRunner {
         let mut metrics = MetricsAccumulator::default();
         let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
         let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
+        let mut throughput_samples = Vec::with_capacity(sample_capacity(files, buffer.len()));
         if phase == StreamingIoPhase::Write {
             fill_benchmark_buffer(&mut buffer);
         }
@@ -202,10 +203,11 @@ impl BenchmarkRunner {
                     sample.offset += bytes_processed;
                     sample.bytes_processed += bytes_processed;
                     metrics.add(sample.mb_per_second);
+                    throughput_samples.push(sample.mb_per_second);
                     on_sample(sample);
                 };
                 match phase {
-                    StreamingIoPhase::Write => self.engine.write_with_buffer(
+                    StreamingIoPhase::Write => StreamingIoEngine::write_with_buffer(
                         StreamingIoPass {
                             path: &file.path,
                             total_bytes: file.bytes,
@@ -216,7 +218,7 @@ impl BenchmarkRunner {
                         &mut observe_sample,
                         &mut *should_stop,
                     )?,
-                    StreamingIoPhase::Read => self.engine.read_with_buffer(
+                    StreamingIoPhase::Read => StreamingIoEngine::read_with_buffer(
                         StreamingIoPass {
                             path: &file.path,
                             total_bytes: file.bytes,
@@ -245,8 +247,26 @@ impl BenchmarkRunner {
             bytes_processed,
             stopped,
             metrics: metrics.finish(),
+            throughput_samples,
         })
     }
+}
+
+fn sample_capacity(files: &[WorkloadFile], block_size: usize) -> usize {
+    const MAX_SAMPLE_CAPACITY: usize = 16_384;
+
+    let Ok(block_size) = u64::try_from(block_size) else {
+        return 0;
+    };
+    if block_size == 0 {
+        return 0;
+    }
+
+    let capacity = files.iter().fold(0_usize, |capacity, file| {
+        let file_samples = usize::try_from(file.bytes.div_ceil(block_size)).unwrap_or(usize::MAX);
+        capacity.saturating_add(file_samples)
+    });
+    capacity.min(MAX_SAMPLE_CAPACITY)
 }
 
 #[derive(Debug, Default)]
@@ -275,8 +295,14 @@ impl MetricsAccumulator {
         self.previous = Some(value);
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sample averages are approximate human-facing throughput metrics"
+    )]
     pub(crate) fn finish(&self) -> BenchmarkPassMetrics {
-        let average = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 };
+        let average = |sum: f64, count: u64| {
+            if count == 0 { 0.0 } else { sum / count as f64 }
+        };
 
         BenchmarkPassMetrics {
             sample_count: self.sample_count,
@@ -304,7 +330,7 @@ pub struct BenchmarkRunnerReport {
 }
 
 /// Summary for one benchmark runner phase pass.
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkPassReport {
     /// Phase executed by this pass.
     pub phase: StreamingIoPhase,
@@ -316,6 +342,8 @@ pub struct BenchmarkPassReport {
     pub stopped: bool,
     /// Metrics calculated from samples emitted during this pass.
     pub metrics: BenchmarkPassMetrics,
+    /// Throughput samples emitted during this pass, in decimal MB/s.
+    pub throughput_samples: Vec<f64>,
 }
 
 /// Throughput metrics calculated from samples for one benchmark pass.
@@ -460,7 +488,7 @@ impl StreamingIoEngine {
         let path = path.as_ref();
         let mut buffer = self.buffer_for_bytes(total_bytes);
         fill_benchmark_buffer(&mut buffer);
-        self.write_with_buffer(
+        Self::write_with_buffer(
             StreamingIoPass {
                 path,
                 total_bytes,
@@ -474,7 +502,6 @@ impl StreamingIoEngine {
     }
 
     fn write_with_buffer(
-        self,
         pass: StreamingIoPass<'_>,
         buffer: &mut [u8],
         on_sample: &mut impl FnMut(StreamingIoSample),
@@ -517,7 +544,7 @@ impl StreamingIoEngine {
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
         let mut buffer = self.buffer_for_bytes(total_bytes);
-        self.read_with_buffer(
+        Self::read_with_buffer(
             StreamingIoPass {
                 path,
                 total_bytes,
@@ -531,7 +558,6 @@ impl StreamingIoEngine {
     }
 
     fn read_with_buffer(
-        self,
         pass: StreamingIoPass<'_>,
         buffer: &mut [u8],
         on_sample: &mut impl FnMut(StreamingIoSample),
@@ -785,7 +811,7 @@ pub enum StreamingIoPhase {
 }
 
 /// Structured progress sample emitted after a block completes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, Serialize)]
 pub struct StreamingIoSample {
     /// Phase that emitted the sample.
     pub phase: StreamingIoPhase,

@@ -151,6 +151,21 @@ fn runner_reports_pass_progress_and_metrics_from_samples() {
     assert_eq!(report.passes[0].metrics.sample_count, 100);
 }
 
+#[test]
+fn runner_includes_completed_pass_samples_for_terminal_charts() {
+    let target = TestDir::new("studiofs-bench-sfs-576-chart-samples");
+    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
+    config.test_mode = DiskTestMode::WriteOnly;
+    let workload = Workload::create_for_bytes(target.path(), 4, FileLayout::SingleFile).unwrap();
+
+    let report = BenchmarkRunner::with_block_size(2)
+        .unwrap()
+        .run_workload(workload, &config, |_| {}, || false)
+        .unwrap();
+
+    assert_eq!(report.passes[0].throughput_samples.len(), 2);
+}
+
 struct TestDir {
     path: PathBuf,
 }

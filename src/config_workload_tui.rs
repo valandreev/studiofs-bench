@@ -26,7 +26,7 @@ pub(crate) const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
 static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Keyboard action understood by the terminal UI shell.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum UiAction {
     /// Move selection to the previous setting.
     MoveUp,
@@ -162,6 +162,7 @@ impl TerminalUi {
                     bytes_processed: progress.bytes_processed,
                     stopped: false,
                     metrics: progress.metrics.finish(),
+                    throughput_samples: progress.throughput_samples,
                 });
             }
             self.progress = Some(LivePassProgress {
@@ -171,6 +172,7 @@ impl TerminalUi {
                 total_bytes,
                 current_mb_per_second: 0.0,
                 metrics: MetricsAccumulator::default(),
+                throughput_samples: Vec::new(),
             });
         }
 
@@ -179,6 +181,7 @@ impl TerminalUi {
             progress.bytes_processed = sample.bytes_processed;
             progress.current_mb_per_second = sample.mb_per_second;
             progress.metrics.add(sample.mb_per_second);
+            progress.throughput_samples.push(sample.mb_per_second);
         }
     }
 
@@ -236,6 +239,10 @@ impl TerminalUi {
         self.render_metrics(frame, metrics);
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "terminal progress and sizes are approximate human-facing values"
+    )]
     fn render_metrics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let [live, summary] =
             Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).areas(area);
@@ -283,21 +290,46 @@ impl TerminalUi {
             );
         }
 
-        let rows = self.pass_summaries.iter().flat_map(|pass| {
-            let metrics = pass.metrics;
-            [
-                ListItem::new(Line::from(format!(
-                    "{} pass {}: Avg {:.1}",
-                    phase_label(pass.phase),
-                    pass.pass_number,
-                    metrics.average_mb_per_second
-                ))),
-                ListItem::new(Line::from(format!(
-                    "Stable {:.1}  Min {:.1}  Drops {}",
-                    metrics.stable_mb_per_second, metrics.minimum_mb_per_second, metrics.drop_count
-                ))),
-            ]
-        });
+        let is_continuous_read_loop = self.config.test_mode == DiskTestMode::WriteOnceReadLoop
+            && self.config.execution_mode == ExecutionMode::Continuous;
+        let latest_read_pass = if is_continuous_read_loop {
+            self.pass_summaries
+                .iter()
+                .filter(|pass| pass.phase == StreamingIoPhase::Read)
+                .map(|pass| pass.pass_number)
+                .max()
+        } else {
+            None
+        };
+        let rows = self
+            .pass_summaries
+            .iter()
+            .filter(move |pass| {
+                if is_continuous_read_loop && pass.phase == StreamingIoPhase::Read {
+                    Some(pass.pass_number) == latest_read_pass
+                } else {
+                    true
+                }
+            })
+            .flat_map(|pass| {
+                let metrics = pass.metrics;
+                let mut rows = vec![
+                    ListItem::new(Line::from(format!(
+                        "{} pass {}: Avg {:.1}",
+                        phase_label(pass.phase),
+                        pass.pass_number,
+                        metrics.average_mb_per_second
+                    ))),
+                    ListItem::new(Line::from(format!(
+                        "Stable {:.1}  Min {:.1}  Drops {}",
+                        metrics.stable_mb_per_second,
+                        metrics.minimum_mb_per_second,
+                        metrics.drop_count
+                    ))),
+                ];
+                append_pass_chart_rows(&mut rows, pass, summary.width.saturating_sub(4));
+                rows
+            });
         frame.render_widget(
             List::new(rows).block(Block::new().title("Pass summaries").borders(Borders::ALL)),
             summary,
@@ -344,11 +376,11 @@ impl TerminalUi {
     fn change_selected(&mut self, next: bool) {
         match self.selected {
             WORKLOAD_SETTING => {
-                self.config.workload_size = next_workload_size(self.config.workload_size, next)
+                self.config.workload_size = next_workload_size(self.config.workload_size, next);
             }
             MODE_SETTING => self.config.test_mode = next_test_mode(self.config.test_mode, next),
             LAYOUT_SETTING => {
-                self.config.file_layout = next_file_layout(self.config.file_layout, next)
+                self.config.file_layout = next_file_layout(self.config.file_layout, next);
             }
             CACHE_SETTING => self.config.cache_mode = next_cache_mode(self.config.cache_mode),
             EXECUTION_MODE_SETTING => {
@@ -356,7 +388,6 @@ impl TerminalUi {
             }
             KEEP_FILES_SETTING => self.config.keep_files = !self.config.keep_files,
             SAVE_REPORT_SETTING => self.config.save_report = !self.config.save_report,
-            TARGET_SETTING => {}
             _ => {}
         }
     }
@@ -380,6 +411,97 @@ struct LivePassProgress {
     total_bytes: u64,
     current_mb_per_second: f64,
     metrics: MetricsAccumulator,
+    throughput_samples: Vec<f64>,
+}
+
+fn append_pass_chart_rows(
+    rows: &mut Vec<ListItem<'static>>,
+    pass: &BenchmarkPassReport,
+    width: u16,
+) {
+    if pass.throughput_samples.is_empty() {
+        return;
+    }
+    let width = usize::from(width);
+    if width < 16 {
+        rows.push(ListItem::new(Line::from("Chart MB/s: too narrow")));
+        return;
+    }
+
+    let plot_width = width.saturating_sub(8).min(32);
+    let points = chart_points(&pass.throughput_samples, plot_width);
+    let max = points
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let top = chart_row(max, max, &points);
+    let mid_value = max / 2.0;
+    let mid = chart_row(mid_value, mid_value, &points);
+    let bottom = chart_row(0.0, 0.0, &points);
+    let progress_gap = " ".repeat(points.len().saturating_sub(2));
+    let strip = stability_strip(&points, max);
+
+    rows.extend([
+        ListItem::new(Line::from("Chart MB/s")),
+        ListItem::new(Line::from(top)),
+        ListItem::new(Line::from(mid)),
+        ListItem::new(Line::from(bottom)),
+        ListItem::new(Line::from(format!("Progress 0%{progress_gap}100%"))),
+        ListItem::new(Line::from(format!("Stability {strip}"))),
+    ]);
+}
+
+fn chart_points(samples: &[f64], width: usize) -> Cow<'_, [f64]> {
+    if width == 0 {
+        return Cow::Borrowed(&[]);
+    }
+    if width == 1 {
+        return samples
+            .first()
+            .map_or(Cow::Borrowed(&[]), |sample| Cow::Owned(vec![*sample]));
+    }
+    if samples.len() <= width {
+        return Cow::Borrowed(samples);
+    }
+    Cow::Owned(
+        (0..width)
+            .map(|index| {
+                let sample_index =
+                    index as u128 * (samples.len() - 1) as u128 / (width - 1) as u128;
+                let sample_index = usize::try_from(sample_index).unwrap_or(samples.len() - 1);
+                samples[sample_index]
+            })
+            .collect(),
+    )
+}
+
+fn chart_row(label: f64, threshold: f64, samples: &[f64]) -> String {
+    let mut row = format!("{label:>5.1} |");
+    row.extend(
+        samples
+            .iter()
+            .map(|sample| if *sample >= threshold { '*' } else { ' ' }),
+    );
+    row
+}
+
+fn stability_strip(samples: &[f64], max: f64) -> String {
+    samples
+        .iter()
+        .map(|sample| {
+            let ratio = sample / max;
+            if ratio >= 0.85 {
+                '.'
+            } else if ratio >= 0.60 {
+                '-'
+            } else if ratio >= 0.10 {
+                '!'
+            } else {
+                'x'
+            }
+        })
+        .collect()
 }
 
 /// Complete benchmark settings for one configured run.
@@ -675,7 +797,8 @@ fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
     for (index, size_slot) in sizes.iter_mut().enumerate() {
         let weight = 95 + index as u64 % 11;
         let size =
-            (u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
+            u64::try_from(u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM))
+                .map_err(|_| ConfigError::WorkloadOverflow)?;
         allocated += size;
         *size_slot += size;
     }
