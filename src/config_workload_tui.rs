@@ -290,9 +290,9 @@ impl TerminalUi {
             );
         }
 
-        let latest_read_pass = if self.config.test_mode == DiskTestMode::WriteOnceReadLoop
-            && self.config.execution_mode == ExecutionMode::Continuous
-        {
+        let is_continuous_read_loop = self.config.test_mode == DiskTestMode::WriteOnceReadLoop
+            && self.config.execution_mode == ExecutionMode::Continuous;
+        let latest_read_pass = if is_continuous_read_loop {
             self.pass_summaries
                 .iter()
                 .filter(|pass| pass.phase == StreamingIoPhase::Read)
@@ -305,7 +305,11 @@ impl TerminalUi {
             .pass_summaries
             .iter()
             .filter(move |pass| {
-                pass.phase != StreamingIoPhase::Read || Some(pass.pass_number) == latest_read_pass
+                if is_continuous_read_loop && pass.phase == StreamingIoPhase::Read {
+                    Some(pass.pass_number) == latest_read_pass
+                } else {
+                    true
+                }
             })
             .flat_map(|pass| {
                 let metrics = pass.metrics;
@@ -449,13 +453,23 @@ fn append_pass_chart_rows(
 }
 
 fn chart_points(samples: &[f64], width: usize) -> Cow<'_, [f64]> {
+    if width == 0 {
+        return Cow::Borrowed(&[]);
+    }
+    if width == 1 {
+        return samples
+            .first()
+            .map_or(Cow::Borrowed(&[]), |sample| Cow::Owned(vec![*sample]));
+    }
     if samples.len() <= width {
         return Cow::Borrowed(samples);
     }
     Cow::Owned(
         (0..width)
             .map(|index| {
-                let sample_index = index * (samples.len() - 1) / (width - 1);
+                let sample_index =
+                    index as u128 * (samples.len() - 1) as u128 / (width - 1) as u128;
+                let sample_index = usize::try_from(sample_index).unwrap_or(samples.len() - 1);
                 samples[sample_index]
             })
             .collect(),

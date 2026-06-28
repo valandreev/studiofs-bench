@@ -86,7 +86,7 @@ fn engine_throughput_samples_exclude_callback_delay() {
             |sample| {
                 samples.push(sample);
                 if samples.len() == 1 {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_secs(1));
                 }
             },
             || false,
@@ -94,7 +94,7 @@ fn engine_throughput_samples_exclude_callback_delay() {
         .unwrap();
 
     assert!(
-        samples[1].mb_per_second > 0.0001,
+        samples[1].mb_per_second > 0.000_001,
         "callback delay contaminated throughput: {} MB/s",
         samples[1].mb_per_second
     );

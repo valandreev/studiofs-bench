@@ -114,3 +114,8 @@ fn terminal_ui_updates_unknown_total_bytes_from_later_samples() {
 
     assert_eq!(ui.progress.unwrap().total_bytes, 10 * DECIMAL_MB);
 }
+
+#[test]
+fn chart_points_handles_single_column_width() {
+    assert_eq!(chart_points(&[1.0, 2.0], 1).as_ref(), &[1.0]);
+}

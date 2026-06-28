@@ -271,6 +271,24 @@ fn terminal_ui_replaces_read_chart_with_latest_continuous_read_pass() {
 }
 
 #[test]
+fn terminal_ui_keeps_read_pass_summary_in_default_read_write_mode() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.finish_run_with_passes(
+        "Done",
+        vec![
+            pass_report(StreamingIoPhase::Write, 1, 120.0),
+            pass_report(StreamingIoPhase::Read, 1, 90.0),
+        ],
+    );
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("read pass 1"));
+}
+
+#[test]
 fn terminal_ui_archives_completed_live_pass_when_next_pass_starts() {
     let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
     let mut ui = TerminalUi::default();

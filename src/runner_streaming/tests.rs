@@ -8,3 +8,13 @@ fn streaming_io_error_exposes_io_source() {
 
     assert!(std::error::Error::source(&error).is_some());
 }
+
+#[test]
+fn sample_capacity_caps_preallocation() {
+    let files = [WorkloadFile {
+        path: "huge.bin".into(),
+        bytes: u64::MAX,
+    }];
+
+    assert_eq!(sample_capacity(&files, 1), 16_384);
+}

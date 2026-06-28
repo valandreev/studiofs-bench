@@ -253,17 +253,20 @@ impl BenchmarkRunner {
 }
 
 fn sample_capacity(files: &[WorkloadFile], block_size: usize) -> usize {
+    const MAX_SAMPLE_CAPACITY: usize = 16_384;
+
     let Ok(block_size) = u64::try_from(block_size) else {
-        return usize::MAX;
+        return 0;
     };
     if block_size == 0 {
         return 0;
     }
 
-    files.iter().fold(0, |capacity, file| {
+    let capacity = files.iter().fold(0_usize, |capacity, file| {
         let file_samples = usize::try_from(file.bytes.div_ceil(block_size)).unwrap_or(usize::MAX);
         capacity.saturating_add(file_samples)
-    })
+    });
+    capacity.min(MAX_SAMPLE_CAPACITY)
 }
 
 #[derive(Debug, Default)]
