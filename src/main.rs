@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    fmt::Write as _,
+    fs::File,
     io::{self, IsTerminal},
     path::PathBuf,
     sync::{
@@ -65,7 +65,8 @@ fn run_scripted(args: &[String]) -> Result<(), String> {
     };
 
     if options.config.save_report {
-        let launch_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let launch_dir = env::current_dir()
+            .map_err(|error| format!("failed to read launch directory: {error}"))?;
         let paths = save_reports(
             &launch_dir,
             &options.config,
@@ -202,9 +203,6 @@ fn save_reports(
             launch_dir.display()
         )
     })?;
-    let prefix = next_report_path_prefix(launch_dir);
-    let json_path = prefix.with_extension("json");
-    let csv_path = prefix.with_extension("csv");
     let payload = serde_json::json!({
         "run": {
             "workload_bytes": workload_bytes,
@@ -221,23 +219,12 @@ fn save_reports(
         "cache_method": cache_method_label(config.cache_mode),
         "passes": report.passes,
     });
-    let json = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
-    write_new(&json_path, &json).map_err(|error| {
-        format!(
-            "failed to write JSON report to {}: {error}",
-            json_path.display()
-        )
-    })?;
-    write_new(&csv_path, passes_csv(&report.passes).as_bytes()).map_err(|error| {
-        format!(
-            "failed to write CSV report to {}: {error}",
-            csv_path.display()
-        )
-    })?;
-    Ok(SavedReportPaths {
-        json: json_path,
-        csv: csv_path,
-    })
+    let files = create_report_files(launch_dir)?;
+    write_report_files(
+        files,
+        |json_file| serde_json::to_writer_pretty(json_file, &payload).map_err(io::Error::other),
+        |csv_file| write_passes_csv(csv_file, &report.passes),
+    )
 }
 
 #[derive(Debug)]
@@ -246,13 +233,51 @@ struct SavedReportPaths {
     csv: PathBuf,
 }
 
-fn next_report_path_prefix(launch_dir: &std::path::Path) -> PathBuf {
+struct OpenedReportFiles {
+    paths: SavedReportPaths,
+    json: File,
+    csv: File,
+}
+
+fn create_report_files(launch_dir: &std::path::Path) -> Result<OpenedReportFiles, String> {
     loop {
         let counter = REPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let prefix = report_path_prefix(launch_dir, SystemTime::now(), counter);
-        if !prefix.with_extension("json").exists() && !prefix.with_extension("csv").exists() {
-            return prefix;
-        }
+        let json_path = prefix.with_extension("json");
+        let csv_path = prefix.with_extension("csv");
+        let json = match create_new_file(&json_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create JSON report {}: {error}",
+                    json_path.display()
+                ));
+            }
+        };
+        let csv = match create_new_file(&csv_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&json_path);
+                continue;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&json_path);
+                return Err(format!(
+                    "failed to create CSV report {}: {error}",
+                    csv_path.display()
+                ));
+            }
+        };
+
+        return Ok(OpenedReportFiles {
+            paths: SavedReportPaths {
+                json: json_path,
+                csv: csv_path,
+            },
+            json,
+            csv,
+        });
     }
 }
 
@@ -268,30 +293,56 @@ fn report_path_prefix(
     launch_dir.join(format!("studiofs-bench-report-{seconds}-{counter}"))
 }
 
-fn write_new(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
+fn create_new_file(path: &std::path::Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
-    std::io::Write::write_all(&mut file, bytes)
+        .open(path)
 }
 
-fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
-    let mut csv = String::from("phase,pass_number,sample_index,mb_per_second\n");
+fn write_report_files(
+    mut files: OpenedReportFiles,
+    write_json: impl FnOnce(&mut File) -> io::Result<()>,
+    write_csv: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<SavedReportPaths, String> {
+    if let Err(error) = write_json(&mut files.json) {
+        cleanup_report_files(&files.paths);
+        return Err(format!(
+            "failed to write JSON report to {}: {error}",
+            files.paths.json.display()
+        ));
+    }
+    if let Err(error) = write_csv(&mut files.csv) {
+        cleanup_report_files(&files.paths);
+        return Err(format!(
+            "failed to write CSV report to {}: {error}",
+            files.paths.csv.display()
+        ));
+    }
+
+    Ok(files.paths)
+}
+
+fn cleanup_report_files(paths: &SavedReportPaths) {
+    let _ = std::fs::remove_file(&paths.json);
+    let _ = std::fs::remove_file(&paths.csv);
+}
+
+fn write_passes_csv(output: &mut impl io::Write, passes: &[BenchmarkPassReport]) -> io::Result<()> {
+    writeln!(output, "phase,pass_number,sample_index,mb_per_second")?;
     for pass in passes {
         for (sample_index, mb_per_second) in pass.throughput_samples.iter().enumerate() {
             writeln!(
-                csv,
+                output,
                 "{},{},{},{}",
                 phase_csv(pass.phase),
                 pass.pass_number,
                 sample_index,
                 mb_per_second
-            )
-            .expect("writing CSV into a String should not fail");
+            )?;
         }
     }
-    csv
+    Ok(())
 }
 
 fn phase_csv(phase: StreamingIoPhase) -> &'static str {
@@ -485,7 +536,16 @@ fn stop_running(running: Option<RunningBenchmark>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write as _, sync::atomic::AtomicU64};
+
     use studiofs_bench::{BenchmarkPassMetrics, StreamingIoPhase};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir(name: &str) -> PathBuf {
+        let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{name}-{}-{id}", std::process::id()))
+    }
 
     fn stopped_report() -> BenchmarkRunnerReport {
         BenchmarkRunnerReport {
@@ -690,7 +750,7 @@ mod tests {
 
     #[test]
     fn report_path_prefix_uses_launch_dir_timestamp_and_counter() {
-        let dir = PathBuf::from("E:/reports");
+        let dir = PathBuf::from("reports");
         let first = report_path_prefix(
             &dir,
             std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
@@ -710,10 +770,7 @@ mod tests {
     fn save_reports_rejects_empty_pass_data() {
         let report = stopped_report();
         let config = BenchmarkConfig::for_target(PathBuf::from("."));
-        let dir = std::env::temp_dir().join(format!(
-            "studiofs-bench-sfs-577-empty-{}",
-            std::process::id()
-        ));
+        let dir = test_dir("studiofs-bench-sfs-577-empty");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -726,10 +783,7 @@ mod tests {
 
     #[test]
     fn save_reports_writes_json_context_and_csv_samples() {
-        let dir = std::env::temp_dir().join(format!(
-            "studiofs-bench-sfs-577-report-{}",
-            std::process::id()
-        ));
+        let dir = test_dir("studiofs-bench-sfs-577-report");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut config = BenchmarkConfig::for_target(PathBuf::from("E:/bench-target"));
@@ -759,6 +813,37 @@ mod tests {
         assert!(csv.contains("phase,pass_number,sample_index,mb_per_second"));
         assert!(csv.contains("write,1,0,10"));
         assert!(csv.contains("write,1,1,20"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_report_files_removes_json_when_csv_write_fails() {
+        let dir = test_dir("studiofs-bench-sfs-577-partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("report.json");
+        let csv_path = dir.join("report.csv");
+        let files = OpenedReportFiles {
+            paths: SavedReportPaths {
+                json: json_path.clone(),
+                csv: csv_path.clone(),
+            },
+            json: File::create(&json_path).unwrap(),
+            csv: File::create(&csv_path).unwrap(),
+        };
+
+        let error = write_report_files(
+            files,
+            |json| json.write_all(b"{\"ok\":true}"),
+            |_csv| Err(io::Error::other("csv failed")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("failed to write CSV report"),
+            "unexpected error: {error}"
+        );
+        assert!(!json_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
