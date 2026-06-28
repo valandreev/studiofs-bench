@@ -222,6 +222,28 @@ fn terminal_ui_renders_completed_pass_chart_progress_axis() {
 }
 
 #[test]
+fn terminal_ui_scales_completed_pass_chart_from_rendered_points() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    let mut samples = vec![100.0; 33];
+    samples[31] = 200.0;
+    ui.finish_run_with_passes(
+        "Done",
+        vec![pass_report_with_samples(
+            StreamingIoPhase::Write,
+            1,
+            samples,
+        )],
+    );
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("100.0 |"));
+    assert!(!output.contains("200.0 |"));
+}
+
+#[test]
 fn terminal_ui_replaces_read_chart_with_latest_continuous_read_pass() {
     let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
     let mut ui = TerminalUi::default();

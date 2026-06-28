@@ -323,7 +323,7 @@ impl TerminalUi {
                         metrics.drop_count
                     ))),
                 ];
-                rows.extend(pass_chart_rows(pass, summary.width.saturating_sub(4)));
+                append_pass_chart_rows(&mut rows, pass, summary.width.saturating_sub(4));
                 rows
             });
         frame.render_widget(
@@ -410,23 +410,27 @@ struct LivePassProgress {
     throughput_samples: Vec<f64>,
 }
 
-fn pass_chart_rows(pass: &BenchmarkPassReport, width: u16) -> Vec<ListItem<'static>> {
+fn append_pass_chart_rows(
+    rows: &mut Vec<ListItem<'static>>,
+    pass: &BenchmarkPassReport,
+    width: u16,
+) {
     if pass.throughput_samples.is_empty() {
-        return Vec::new();
+        return;
     }
     let width = usize::from(width);
     if width < 16 {
-        return vec![ListItem::new(Line::from("Chart MB/s: too narrow"))];
+        rows.push(ListItem::new(Line::from("Chart MB/s: too narrow")));
+        return;
     }
 
-    let max = pass
-        .throughput_samples
+    let plot_width = width.saturating_sub(8).min(32);
+    let points = chart_points(&pass.throughput_samples, plot_width);
+    let max = points
         .iter()
         .copied()
         .fold(0.0_f64, f64::max)
         .max(f64::EPSILON);
-    let plot_width = width.saturating_sub(8).min(32);
-    let points = chart_points(&pass.throughput_samples, plot_width);
     let top = chart_row(max, max, &points);
     let mid_value = max / 2.0;
     let mid = chart_row(mid_value, mid_value, &points);
@@ -434,14 +438,14 @@ fn pass_chart_rows(pass: &BenchmarkPassReport, width: u16) -> Vec<ListItem<'stat
     let progress_gap = " ".repeat(points.len().saturating_sub(2));
     let strip = stability_strip(&points, max);
 
-    vec![
+    rows.extend([
         ListItem::new(Line::from("Chart MB/s")),
         ListItem::new(Line::from(top)),
         ListItem::new(Line::from(mid)),
         ListItem::new(Line::from(bottom)),
         ListItem::new(Line::from(format!("Progress 0%{progress_gap}100%"))),
         ListItem::new(Line::from(format!("Stability {strip}"))),
-    ]
+    ]);
 }
 
 fn chart_points(samples: &[f64], width: usize) -> Vec<f64> {
@@ -457,11 +461,11 @@ fn chart_points(samples: &[f64], width: usize) -> Vec<f64> {
 }
 
 fn chart_row(label: f64, threshold: f64, samples: &[f64]) -> String {
-    let points = samples
-        .iter()
-        .map(|sample| if *sample >= threshold { '*' } else { ' ' })
-        .collect::<String>();
-    format!("{label:>5.1} |{points}")
+    let mut row = format!("{label:>5.1} |");
+    for sample in samples {
+        row.push(if *sample >= threshold { '*' } else { ' ' });
+    }
+    row
 }
 
 fn stability_strip(samples: &[f64], max: f64) -> String {
