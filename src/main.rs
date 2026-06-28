@@ -23,8 +23,13 @@ use studiofs_bench::{
 
 fn main() -> io::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.first().is_some_and(|arg| arg == "--scripted") {
-        return run_scripted(&args[1..]).map_err(io::Error::other);
+    if args.iter().any(|arg| arg == "--scripted") {
+        let args = args
+            .iter()
+            .filter(|arg| arg.as_str() != "--scripted")
+            .cloned()
+            .collect::<Vec<_>>();
+        return run_scripted(&args).map_err(io::Error::other);
     }
 
     if !io::stdout().is_terminal() {
@@ -178,6 +183,16 @@ fn save_reports(
     workload_bytes: Option<u64>,
     report: &BenchmarkRunnerReport,
 ) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create report directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
     let json_path = path.with_extension("json");
     let csv_path = path.with_extension("csv");
     let payload = serde_json::json!({
@@ -186,8 +201,18 @@ fn save_reports(
         "report": report,
     });
     let json = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
-    std::fs::write(json_path, json).map_err(|error| error.to_string())?;
-    std::fs::write(csv_path, passes_csv(&report.passes)).map_err(|error| error.to_string())?;
+    std::fs::write(&json_path, json).map_err(|error| {
+        format!(
+            "failed to write JSON report to {}: {error}",
+            json_path.display()
+        )
+    })?;
+    std::fs::write(&csv_path, passes_csv(&report.passes)).map_err(|error| {
+        format!(
+            "failed to write CSV report to {}: {error}",
+            csv_path.display()
+        )
+    })?;
     Ok(())
 }
 

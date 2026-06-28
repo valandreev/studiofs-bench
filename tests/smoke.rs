@@ -19,12 +19,12 @@ fn binary_prints_name() {
 #[test]
 fn scripted_mode_runs_tiny_benchmark_and_saves_reports() {
     let dir = TestDir::new("studiofs-bench-sfs-578-scripted");
-    let report = dir.path().join("report");
+    let report = dir.path().join("reports").join("report");
 
     let output = Command::new(env!("CARGO_BIN_EXE_studiofs-bench"))
-        .arg("--scripted")
         .arg("--target")
         .arg(dir.path())
+        .arg("--scripted")
         .arg("--workload-bytes")
         .arg("8")
         .arg("--mode")
