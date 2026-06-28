@@ -751,10 +751,14 @@ impl Workload {
     ///
     /// Returns [`WorkloadError`] when removing the run directory fails.
     pub fn cleanup(self) -> Result<(), WorkloadError> {
-        match std::fs::remove_dir_all(&self.run_dir) {
+        let run_dir = self.run_dir;
+        match std::fs::remove_dir_all(&run_dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(path_io_error(&self.run_dir, error)),
+            Err(error) => Err(WorkloadError::PathIo {
+                path: run_dir,
+                source: error,
+            }),
         }
     }
 }

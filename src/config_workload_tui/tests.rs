@@ -69,10 +69,10 @@ fn cleanup_error_includes_run_dir_path() {
 
     let error = workload.cleanup().unwrap_err();
 
-    assert!(
-        error.to_string().contains(&run_dir.display().to_string()),
-        "cleanup path not reported in error: {error}"
-    );
+    let WorkloadError::PathIo { path, .. } = error else {
+        panic!("cleanup should return a path-aware error: {error}");
+    };
+    assert_eq!(path, run_dir);
     let _ = std::fs::remove_file(&run_dir);
 }
 

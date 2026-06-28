@@ -4,7 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use studiofs_bench::{CacheControlMethod, CacheMode, StreamingIoEngine, StreamingIoPhase};
+use studiofs_bench::{
+    CacheControlMethod, CacheMode, StreamingIoEngine, StreamingIoError, StreamingIoPhase,
+};
 
 #[test]
 fn engine_writes_reads_and_reports_sequential_samples() {
@@ -145,10 +147,13 @@ fn engine_read_error_includes_missing_file_path() {
         .read_with_cache_mode(&path, 1, CacheMode::Enabled, 1, |_| {}, || false)
         .unwrap_err();
 
-    assert!(
-        error.to_string().contains(&path.display().to_string()),
-        "missing path not reported in error: {error}"
-    );
+    let StreamingIoError::PathIo {
+        path: error_path, ..
+    } = error
+    else {
+        panic!("missing read should return a path-aware error: {error}");
+    };
+    assert_eq!(error_path, path);
 }
 
 #[test]
