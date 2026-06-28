@@ -18,6 +18,7 @@ fn default_config_uses_documented_benchmark_contract() {
     assert_eq!(config.test_mode, DiskTestMode::ReadWrite);
     assert_eq!(config.file_layout, FileLayout::SingleFile);
     assert_eq!(config.cache_mode, CacheMode::Enabled);
+    assert!(config.batch_fsync);
     assert!(!config.keep_files);
     assert!(!config.save_report);
     assert_eq!(config.execution_mode, ExecutionMode::RunOnce);
@@ -85,6 +86,7 @@ fn config_serializes_report_ready_values() {
     config.run_mode = RunMode::MountedFilesystem;
     config.test_mode = DiskTestMode::WriteOnceReadLoop;
     config.cache_mode = CacheMode::Disabled;
+    config.batch_fsync = false;
     config.keep_files = true;
     config.save_report = false;
     config.execution_mode = ExecutionMode::Continuous;
@@ -96,6 +98,7 @@ fn config_serializes_report_ready_values() {
     assert_eq!(value["test_mode"], "write_once_read_loop");
     assert_eq!(value["file_layout"], "single_file");
     assert_eq!(value["cache_mode"], "disabled");
+    assert_eq!(value["batch_fsync"], false);
     assert_eq!(value["keep_files"], true);
     assert_eq!(value["save_report"], false);
     assert_eq!(value["execution_mode"], "continuous");

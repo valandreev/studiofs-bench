@@ -21,6 +21,7 @@ fn terminal_ui_shows_editable_benchmark_settings() {
     assert!(output.contains("Mode"));
     assert!(output.contains("Layout"));
     assert!(output.contains("Cache mode"));
+    assert!(output.contains("Batch fsync"));
     assert!(output.contains("Execution mode"));
     assert!(output.contains("Keep files"));
     assert!(output.contains("Save report"));
@@ -34,7 +35,7 @@ fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
     for value in "/tmp/bench".chars() {
         ui.handle_action(UiAction::InsertText(value));
     }
-    for _ in 0..7 {
+    for _ in 0..8 {
         ui.handle_action(UiAction::MoveDown);
         ui.handle_action(UiAction::NextValue);
     }
@@ -45,6 +46,7 @@ fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
     assert_eq!(config.test_mode, DiskTestMode::WriteOnly);
     assert_eq!(config.file_layout, FileLayout::HundredFilesPlusMinusFive);
     assert_eq!(config.cache_mode, CacheMode::Disabled);
+    assert!(!config.batch_fsync);
     assert_eq!(config.execution_mode, ExecutionMode::Continuous);
     assert!(config.keep_files);
     assert!(config.save_report);
@@ -251,6 +253,7 @@ fn terminal_ui_replaces_read_chart_with_latest_continuous_read_pass() {
     ui.handle_action(UiAction::MoveDown);
     ui.handle_action(UiAction::NextValue);
     ui.handle_action(UiAction::NextValue);
+    ui.handle_action(UiAction::MoveDown);
     ui.handle_action(UiAction::MoveDown);
     ui.handle_action(UiAction::MoveDown);
     ui.handle_action(UiAction::MoveDown);

@@ -287,6 +287,7 @@ fn scripted_options_parse_scripted_settings() {
         "hundred-files-plus-minus-five",
         "--cache",
         "disabled",
+        "--no-batch-fsync",
         "--keep-files",
         "--save-report",
     ]
@@ -306,6 +307,7 @@ fn scripted_options_parse_scripted_settings() {
         FileLayout::HundredFilesPlusMinusFive
     );
     assert_eq!(options.config.cache_mode, CacheMode::Disabled);
+    assert!(!options.config.batch_fsync);
     assert!(options.config.keep_files);
     assert!(options.config.save_report);
 }

@@ -3,6 +3,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::Serialize;
 use thiserror::Error;
 
@@ -218,6 +221,7 @@ impl BenchmarkRunner {
                             total_bytes: file.bytes,
                             cache_mode: config.cache_mode,
                             pass_number,
+                            sync_on_complete: !config.batch_fsync,
                         },
                         &mut buffer,
                         &mut observe_sample,
@@ -229,6 +233,7 @@ impl BenchmarkRunner {
                             total_bytes: file.bytes,
                             cache_mode: config.cache_mode,
                             pass_number,
+                            sync_on_complete: false,
                         },
                         &mut buffer,
                         &mut observe_sample,
@@ -244,6 +249,14 @@ impl BenchmarkRunner {
             if stopped {
                 break;
             }
+        }
+
+        if phase == StreamingIoPhase::Write
+            && config.batch_fsync
+            && !stopped
+            && let Some(file) = files.last()
+        {
+            sync_path(&file.path)?;
         }
 
         Ok(BenchmarkPassReport {
@@ -511,6 +524,7 @@ impl StreamingIoEngine {
                 total_bytes,
                 cache_mode,
                 pass_number,
+                sync_on_complete: true,
             },
             &mut buffer,
             &mut on_sample,
@@ -530,15 +544,7 @@ impl StreamingIoEngine {
         let mut report = empty_streaming_report(pass.cache_mode);
 
         let mut output = create_file(pass.path, pass.cache_mode)?;
-        report.bytes_written = stream_write(
-            pass.path,
-            &mut output,
-            buffer,
-            pass.total_bytes,
-            pass.pass_number,
-            on_sample,
-            should_stop,
-        )?;
+        report.bytes_written = stream_write(pass, &mut output, buffer, on_sample, should_stop)?;
 
         after_cache_io(&output, pass.cache_mode);
         report.stopped = report.bytes_written < pass.total_bytes;
@@ -568,6 +574,7 @@ impl StreamingIoEngine {
                 total_bytes,
                 cache_mode,
                 pass_number,
+                sync_on_complete: false,
             },
             &mut buffer,
             &mut on_sample,
@@ -616,6 +623,7 @@ struct StreamingIoPass<'a> {
     total_bytes: u64,
     cache_mode: CacheMode,
     pass_number: u64,
+    sync_on_complete: bool,
 }
 
 fn empty_streaming_report(cache_mode: CacheMode) -> StreamingIoReport {
@@ -655,6 +663,20 @@ fn path_io_error(path: &Path, source: io::Error) -> StreamingIoError {
         path: path.to_owned(),
         source,
     }
+}
+
+fn sync_path(path: &Path) -> Result<(), StreamingIoError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| path_io_error(path, error))?;
+    sync_file(path, &file)
+}
+
+fn sync_file(path: &Path, file: &File) -> Result<(), StreamingIoError> {
+    note_sync_call();
+    file.sync_all().map_err(|error| path_io_error(path, error))
 }
 
 #[cfg(windows)]
@@ -720,40 +742,36 @@ fn disabled_cache_method() -> CacheControlMethod {
 }
 
 fn stream_write(
-    path: &Path,
+    pass: StreamingIoPass<'_>,
     output: &mut File,
     buffer: &mut [u8],
-    total_bytes: u64,
-    pass_number: u64,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
     let mut elapsed_io = Duration::ZERO;
     let mut processed = 0;
 
-    while processed < total_bytes {
+    while processed < pass.total_bytes {
         if should_stop() {
             break;
         }
 
         let offset = processed;
-        let chunk = chunk_len(buffer.len(), total_bytes - processed);
-        let is_final_chunk = processed + chunk as u64 == total_bytes;
+        let chunk = chunk_len(buffer.len(), pass.total_bytes - processed);
+        let is_final_chunk = processed + chunk as u64 == pass.total_bytes;
         stamp_block_offset(&mut buffer[..chunk], offset);
         let io_start = Instant::now();
         output
             .write_all(&buffer[..chunk])
-            .map_err(|error| path_io_error(path, error))?;
-        if is_final_chunk {
-            output
-                .sync_all()
-                .map_err(|error| path_io_error(path, error))?;
+            .map_err(|error| path_io_error(pass.path, error))?;
+        if pass.sync_on_complete && is_final_chunk {
+            sync_file(pass.path, output)?;
         }
         elapsed_io += io_start.elapsed();
         processed += chunk as u64;
         on_sample(sample(
             StreamingIoPhase::Write,
-            pass_number,
+            pass.pass_number,
             offset,
             processed,
             elapsed_io,
@@ -761,6 +779,27 @@ fn stream_write(
     }
 
     Ok(processed)
+}
+
+#[cfg(test)]
+static SYNC_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn note_sync_call() {
+    SYNC_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_sync_call() {}
+
+#[cfg(test)]
+fn reset_sync_call_count() {
+    SYNC_CALL_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn sync_call_count() -> usize {
+    SYNC_CALL_COUNT.load(Ordering::Relaxed)
 }
 
 fn stream_read(

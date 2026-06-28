@@ -149,6 +149,7 @@ impl ScriptedOptions {
                         FileLayout::FixedFileSizeMb(parse_u64(next_arg(&mut args)?)?);
                 }
                 "--cache" => config.cache_mode = parse_cache_mode(next_arg(&mut args)?)?,
+                "--no-batch-fsync" => config.batch_fsync = false,
                 "--execution" => {
                     config.execution_mode = parse_execution_mode(next_arg(&mut args)?)?;
                 }

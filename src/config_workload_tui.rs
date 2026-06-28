@@ -358,6 +358,10 @@ impl TerminalUi {
                 Cow::Borrowed(cache_mode_label(self.config.cache_mode)),
             ),
             (
+                "Batch fsync",
+                Cow::Borrowed(bool_label(self.config.batch_fsync)),
+            ),
+            (
                 "Execution mode",
                 Cow::Borrowed(execution_mode_label(self.config.execution_mode)),
             ),
@@ -382,6 +386,7 @@ impl TerminalUi {
                 self.config.file_layout = next_file_layout(self.config.file_layout, next);
             }
             CACHE_SETTING => self.config.cache_mode = next_cache_mode(self.config.cache_mode),
+            BATCH_FSYNC_SETTING => self.config.batch_fsync = !self.config.batch_fsync,
             EXECUTION_MODE_SETTING => {
                 self.config.execution_mode = next_execution_mode(self.config.execution_mode);
             }
@@ -397,10 +402,11 @@ const WORKLOAD_SETTING: usize = 1;
 const MODE_SETTING: usize = 2;
 const LAYOUT_SETTING: usize = 3;
 const CACHE_SETTING: usize = 4;
-const EXECUTION_MODE_SETTING: usize = 5;
-const KEEP_FILES_SETTING: usize = 6;
-const SAVE_REPORT_SETTING: usize = 7;
-const SETTING_COUNT: usize = 8;
+const BATCH_FSYNC_SETTING: usize = 5;
+const EXECUTION_MODE_SETTING: usize = 6;
+const KEEP_FILES_SETTING: usize = 7;
+const SAVE_REPORT_SETTING: usize = 8;
+const SETTING_COUNT: usize = 9;
 
 #[derive(Debug)]
 struct LivePassProgress {
@@ -518,6 +524,8 @@ pub struct BenchmarkConfig {
     pub file_layout: FileLayout,
     /// Cache behavior expected for the run.
     pub cache_mode: CacheMode,
+    /// Whether write passes delay fsync until the end of the file sequence.
+    pub batch_fsync: bool,
     /// Whether generated benchmark files remain after the run.
     pub keep_files: bool,
     /// Whether the runner should save a report.
@@ -540,6 +548,7 @@ impl BenchmarkConfig {
             test_mode: DiskTestMode::ReadWrite,
             file_layout: FileLayout::SingleFile,
             cache_mode: CacheMode::Enabled,
+            batch_fsync: true,
             keep_files: false,
             save_report: false,
             execution_mode: ExecutionMode::RunOnce,

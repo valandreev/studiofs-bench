@@ -169,7 +169,8 @@ fn runner_includes_completed_pass_samples_for_terminal_charts() {
 #[test]
 fn runner_error_exposes_completed_passes_after_later_phase_fails() {
     let target = TestDir::new("studiofs-bench-sfs-579-partial-error");
-    let config = BenchmarkConfig::for_target(target.path().to_owned());
+    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
+    config.batch_fsync = false;
     let workload = Workload::create_for_bytes(target.path(), 4, FileLayout::SingleFile).unwrap();
     let file = workload.files()[0].path.clone();
 
