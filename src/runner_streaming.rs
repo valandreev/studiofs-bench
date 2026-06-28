@@ -427,7 +427,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// Returns [`StreamingIoError::PathIo`] when creating, opening, reading,
     /// writing, or syncing the benchmark file fails.
     pub fn run(
         self,
@@ -449,7 +449,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, opening, reading,
+    /// Returns [`StreamingIoError::PathIo`] when creating, opening, reading,
     /// writing, or syncing the benchmark file fails.
     pub fn run_with_cache_mode(
         self,
@@ -492,7 +492,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when creating, writing, or syncing the file fails.
+    /// Returns [`StreamingIoError::PathIo`] when creating, writing, or syncing the file fails.
     pub fn write_with_cache_mode(
         self,
         path: impl AsRef<std::path::Path>,
@@ -550,7 +550,7 @@ impl StreamingIoEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamingIoError::Io`] when opening or reading the file fails.
+    /// Returns [`StreamingIoError::PathIo`] when opening or reading the file fails.
     pub fn read_with_cache_mode(
         self,
         path: impl AsRef<std::path::Path>,

@@ -16,9 +16,9 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkPassReport, BenchmarkRunner, BenchmarkRunnerReport, CacheMode,
-    DiskTestMode, ExecutionMode, FileLayout, RunMode, StreamingIoPhase, StreamingIoSample,
-    TerminalUi, UiAction, Workload, WorkloadSize,
+    BenchmarkConfig, BenchmarkPassReport, BenchmarkRunner, BenchmarkRunnerError,
+    BenchmarkRunnerReport, CacheMode, DiskTestMode, ExecutionMode, FileLayout, RunMode,
+    StreamingIoPhase, StreamingIoSample, TerminalUi, UiAction, Workload, WorkloadSize,
 };
 
 static REPORT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -55,13 +55,15 @@ fn run_scripted(args: &[String]) -> Result<(), String> {
             options.config.file_layout,
         )
         .map_err(|error| error.to_string())?;
-        runner
-            .run_workload(workload, &options.config, |_| {}, || false)
-            .map_err(|error| error.to_string())?
+        match runner.run_workload(workload, &options.config, |_| {}, || false) {
+            Ok(report) => report,
+            Err(error) => return finish_scripted_error(&error, &options),
+        }
     } else {
-        runner
-            .run(&options.config, |_| {}, || false)
-            .map_err(|error| error.to_string())?
+        match runner.run(&options.config, |_| {}, || false) {
+            Ok(report) => report,
+            Err(error) => return finish_scripted_error(&error, &options),
+        }
     };
 
     if options.config.save_report {
@@ -82,6 +84,31 @@ fn run_scripted(args: &[String]) -> Result<(), String> {
 
     println!("Done - {} passes", report.passes.len());
     Ok(())
+}
+
+fn finish_scripted_error(
+    error: &BenchmarkRunnerError,
+    options: &ScriptedOptions,
+) -> Result<(), String> {
+    if let BenchmarkRunnerError::RunFailed { partial_report, .. } = error
+        && options.config.save_report
+    {
+        let launch_dir = env::current_dir()
+            .map_err(|error| format!("failed to read launch directory: {error}"))?;
+        let paths = save_reports(
+            &launch_dir,
+            &options.config,
+            options.workload_bytes,
+            partial_report,
+        )?;
+        println!(
+            "Reports saved - {}, {}",
+            paths.json.display(),
+            paths.csv.display()
+        );
+    }
+
+    Err(error.to_string())
 }
 
 struct ScriptedOptions {
@@ -472,7 +499,44 @@ fn key_action(code: KeyCode) -> Option<UiAction> {
 struct RunningBenchmark {
     stop: Arc<AtomicBool>,
     samples: Receiver<StreamingIoSample>,
-    done: Receiver<Result<BenchmarkRunnerReport, String>>,
+    done: Receiver<Result<BenchmarkRunnerReport, BenchmarkRunError>>,
+}
+
+#[derive(Debug)]
+struct BenchmarkRunError {
+    message: String,
+    passes: Vec<BenchmarkPassReport>,
+}
+
+impl BenchmarkRunError {
+    fn from_runner(error: BenchmarkRunnerError) -> Self {
+        let message = error.to_string();
+        match error {
+            BenchmarkRunnerError::RunFailed { partial_report, .. } => {
+                let BenchmarkRunnerReport { passes, .. } = *partial_report;
+                Self { message, passes }
+            }
+            _ => Self {
+                message,
+                passes: Vec::new(),
+            },
+        }
+    }
+
+    fn with_report(message: String, report: BenchmarkRunnerReport) -> Self {
+        Self {
+            message,
+            passes: report.passes,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_report(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            passes: Vec::new(),
+        }
+    }
 }
 
 fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
@@ -490,11 +554,19 @@ fn spawn_benchmark(config: BenchmarkConfig) -> RunningBenchmark {
                 },
                 || should_stop.load(Ordering::Relaxed),
             )
-            .map_err(|error| error.to_string())
+            .map_err(BenchmarkRunError::from_runner)
             .and_then(|report| {
-                if config.save_report {
-                    let launch_dir = env::current_dir().map_err(|error| error.to_string())?;
-                    save_reports(&launch_dir, &config, None, &report)?;
+                if !config.save_report {
+                    return Ok(report);
+                }
+                let launch_dir = match env::current_dir() {
+                    Ok(launch_dir) => launch_dir,
+                    Err(error) => {
+                        return Err(BenchmarkRunError::with_report(error.to_string(), report));
+                    }
+                };
+                if let Err(error) = save_reports(&launch_dir, &config, None, &report) {
+                    return Err(BenchmarkRunError::with_report(error, report));
                 }
                 Ok(report)
             });
@@ -527,7 +599,12 @@ fn finish_completed_run(running: &mut Option<RunningBenchmark>, ui: &mut Termina
                     };
                     ui.finish_run_with_passes(message, report.passes);
                 }
-                Err(error) => ui.finish_run(format!("Error - {error}")),
+                Err(error) if error.passes.is_empty() => {
+                    ui.finish_run(format!("Error - {}", error.message));
+                }
+                Err(error) => {
+                    ui.finish_run_with_passes(format!("Error - {}", error.message), error.passes);
+                }
             }
             *running = None;
             true
@@ -556,7 +633,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
-    use studiofs_bench::{BenchmarkPassMetrics, StreamingIoPhase};
+    use studiofs_bench::{BenchmarkPassMetrics, ConfigError, StreamingIoPhase};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -685,7 +762,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (_sample_tx, samples) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
-        done_tx.send(Err(String::from("failed"))).unwrap();
+        done_tx
+            .send(Err(BenchmarkRunError::without_report("failed")))
+            .unwrap();
         let mut running = Some(RunningBenchmark {
             stop,
             samples,
@@ -697,6 +776,54 @@ mod tests {
         assert!(changed);
         assert_render_contains(&ui, "write pass 1: Avg 100.0");
         assert_render_contains(&ui, "Error - failed");
+    }
+
+    #[test]
+    fn finish_completed_run_uses_partial_report_from_run_failed_error() {
+        let mut ui = TerminalUi::default();
+        ui.handle_action(UiAction::Submit);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_sample_tx, samples) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let report = BenchmarkRunnerReport {
+            run_dir: ".".into(),
+            files_kept: false,
+            cleanup_error: None,
+            passes: vec![BenchmarkPassReport {
+                phase: StreamingIoPhase::Write,
+                pass_number: 1,
+                bytes_processed: 1,
+                stopped: false,
+                metrics: BenchmarkPassMetrics {
+                    sample_count: 1,
+                    average_mb_per_second: 123.0,
+                    stable_mb_per_second: 123.0,
+                    minimum_mb_per_second: 123.0,
+                    drop_count: 0,
+                },
+                throughput_samples: Vec::new(),
+            }],
+            stopped: false,
+        };
+        done_tx
+            .send(Err(BenchmarkRunError::from_runner(
+                BenchmarkRunnerError::RunFailed {
+                    source: Box::new(BenchmarkRunnerError::Config(ConfigError::ZeroWorkload)),
+                    partial_report: Box::new(report),
+                },
+            )))
+            .unwrap();
+        let mut running = Some(RunningBenchmark {
+            stop,
+            samples,
+            done,
+        });
+
+        let changed = finish_completed_run(&mut running, &mut ui);
+
+        assert!(changed);
+        assert_render_contains(&ui, "write pass 1: Avg 123.0");
+        assert_render_contains(&ui, "Error - benchmark failed after 1 completed passes");
     }
 
     #[test]
