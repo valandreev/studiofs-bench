@@ -76,7 +76,8 @@ selected workload, optionally reads it back, and reports throughput in decimal
 The I/O engine is one dense sequential streaming engine. It uses an internal
 8 MB block size for normal runs, fills write buffers with deterministic non-zero
 data, and samples throughput after completed blocks. The final write block is
-synced before the write pass completes.
+synced before the write pass completes when `Batch fsync` is disabled. By
+default, write fsync is batched until the end of the write file sequence.
 
 ## Interactive Controls
 
@@ -104,6 +105,9 @@ Settings are locked while a run is active.
   mode also accepts `--file-size-mb <n>` for fixed-size files.
 - `Cache mode`: `enabled` uses normal file I/O. `disabled` requests best-effort
   cache-reduced I/O for the platform.
+- `Batch fsync`: enabled by default. When enabled, write fsync is delayed until
+  the end of the write file sequence. When disabled, each written file is synced
+  before that file completes.
 - `Execution mode`: `run once` completes one configured run. `continuous`
   repeats configured phases until stopped. Scripted mode only supports
   `run-once`.
@@ -119,6 +123,7 @@ Scripted options:
 - `--layout single-file|hundred-files-plus-minus-five`
 - `--file-size-mb <n>`
 - `--cache enabled|disabled`
+- `--no-batch-fsync`
 - `--execution run-once`
 - `--keep-files`
 - `--save-report`
@@ -159,6 +164,16 @@ completed pass data and show the cleanup error.
 
 Cache controls are not identical across operating systems. Compare runs only
 when the cache mode, target path, and machine setup are the same.
+
+## Write Sync Behavior
+
+`Batch fsync` is enabled by default. The runner writes all files in the write
+sequence first, then performs one final sync before the write pass is complete.
+This matches file-manager style copy behavior more closely than syncing after
+every file.
+
+Pass `--no-batch-fsync` or disable `Batch fsync` in the UI when you need the
+legacy behavior where every written file is synced as soon as it completes.
 
 ## Reports
 
@@ -211,8 +226,8 @@ Compare runs only on the same fixed test bench:
 
 - Same machine, operating system, power mode, storage target, filesystem, and
   mount point.
-- Same target path, workload size, file layout, cache mode, run mode, and
-  execution mode.
+- Same target path, workload size, file layout, cache mode, batch fsync setting,
+  run mode, and execution mode.
 - Multiple saved passes before calculating averages.
 
 For validation against a reference disk benchmark, use the contract in

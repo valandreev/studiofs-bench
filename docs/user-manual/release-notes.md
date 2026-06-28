@@ -15,6 +15,8 @@ First working `studiofs-bench` release.
 - Run modes for local filesystem paths and mounted filesystem paths.
 - Benchmark modes for read/write, write-only, and write-once/read-loop runs.
 - Best-effort cache-reduced mode for Windows, macOS, and Linux.
+- Batch fsync by default, with per-file fsync available through `Batch fsync`
+  off or `--no-batch-fsync`.
 - Safe cleanup by default, with `Keep files` / `--keep-files` for inspection.
 - Optional JSON and CSV reports with pass metrics and raw throughput samples.
 - Reference validation contract for comparing saved runs on a fixed test bench.

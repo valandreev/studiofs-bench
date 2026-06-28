@@ -16,11 +16,12 @@ Record these fields before each validation run:
 - Workload size: 4 GB.
 - File layout: single file.
 - Cache mode: enabled or disabled, matching both tools as closely as possible.
+- Batch fsync: enabled or disabled.
 - Run mode: local filesystem or mounted filesystem.
 - Execution: run once per pass.
 
 Do not compare results across different machines, disks, workload sizes, file
-layouts, cache modes, or mount points.
+layouts, cache modes, batch fsync settings, or mount points.
 
 ## Multiple passes
 
