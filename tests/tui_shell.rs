@@ -202,6 +202,26 @@ fn terminal_ui_renders_completed_pass_chart_and_stability_strip() {
 }
 
 #[test]
+fn terminal_ui_renders_completed_pass_chart_progress_axis() {
+    let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+    let mut ui = TerminalUi::default();
+    ui.finish_run_with_passes(
+        "Done",
+        vec![pass_report_with_samples(
+            StreamingIoPhase::Write,
+            1,
+            vec![100.0, 90.0, 80.0, 40.0],
+        )],
+    );
+
+    terminal.draw(|frame| ui.render(frame)).unwrap();
+    let output = terminal.backend().to_string();
+
+    assert!(output.contains("Progress 0%"));
+    assert!(output.contains("100%"));
+}
+
+#[test]
 fn terminal_ui_replaces_read_chart_with_latest_continuous_read_pass() {
     let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
     let mut ui = TerminalUi::default();
@@ -303,6 +323,15 @@ fn pass_report(
     pass_number: u64,
     mb_per_second: f64,
 ) -> BenchmarkPassReport {
+    pass_report_with_samples(phase, pass_number, vec![mb_per_second])
+}
+
+fn pass_report_with_samples(
+    phase: StreamingIoPhase,
+    pass_number: u64,
+    throughput_samples: Vec<f64>,
+) -> BenchmarkPassReport {
+    let mb_per_second = throughput_samples[0];
     BenchmarkPassReport {
         phase,
         pass_number,
@@ -315,6 +344,6 @@ fn pass_report(
             minimum_mb_per_second: mb_per_second,
             drop_count: 0,
         },
-        throughput_samples: vec![mb_per_second],
+        throughput_samples,
     }
 }

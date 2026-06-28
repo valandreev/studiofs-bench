@@ -207,7 +207,7 @@ impl BenchmarkRunner {
                     on_sample(sample);
                 };
                 match phase {
-                    StreamingIoPhase::Write => self.engine.write_with_buffer(
+                    StreamingIoPhase::Write => StreamingIoEngine::write_with_buffer(
                         StreamingIoPass {
                             path: &file.path,
                             total_bytes: file.bytes,
@@ -218,7 +218,7 @@ impl BenchmarkRunner {
                         &mut observe_sample,
                         &mut *should_stop,
                     )?,
-                    StreamingIoPhase::Read => self.engine.read_with_buffer(
+                    StreamingIoPhase::Read => StreamingIoEngine::read_with_buffer(
                         StreamingIoPass {
                             path: &file.path,
                             total_bytes: file.bytes,
@@ -278,8 +278,14 @@ impl MetricsAccumulator {
         self.previous = Some(value);
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sample averages are approximate human-facing throughput metrics"
+    )]
     pub(crate) fn finish(&self) -> BenchmarkPassMetrics {
-        let average = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 };
+        let average = |sum: f64, count: u64| {
+            if count == 0 { 0.0 } else { sum / count as f64 }
+        };
 
         BenchmarkPassMetrics {
             sample_count: self.sample_count,
@@ -465,7 +471,7 @@ impl StreamingIoEngine {
         let path = path.as_ref();
         let mut buffer = self.buffer_for_bytes(total_bytes);
         fill_benchmark_buffer(&mut buffer);
-        self.write_with_buffer(
+        Self::write_with_buffer(
             StreamingIoPass {
                 path,
                 total_bytes,
@@ -479,7 +485,6 @@ impl StreamingIoEngine {
     }
 
     fn write_with_buffer(
-        self,
         pass: StreamingIoPass<'_>,
         buffer: &mut [u8],
         on_sample: &mut impl FnMut(StreamingIoSample),
@@ -522,7 +527,7 @@ impl StreamingIoEngine {
     ) -> Result<StreamingIoReport, StreamingIoError> {
         let path = path.as_ref();
         let mut buffer = self.buffer_for_bytes(total_bytes);
-        self.read_with_buffer(
+        Self::read_with_buffer(
             StreamingIoPass {
                 path,
                 total_bytes,
@@ -536,7 +541,6 @@ impl StreamingIoEngine {
     }
 
     fn read_with_buffer(
-        self,
         pass: StreamingIoPass<'_>,
         buffer: &mut [u8],
         on_sample: &mut impl FnMut(StreamingIoSample),
@@ -790,7 +794,7 @@ pub enum StreamingIoPhase {
 }
 
 /// Structured progress sample emitted after a block completes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, Serialize)]
 pub struct StreamingIoSample {
     /// Phase that emitted the sample.
     pub phase: StreamingIoPhase,

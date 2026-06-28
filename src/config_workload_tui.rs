@@ -26,7 +26,7 @@ pub(crate) const STAMP_INTERVAL_BYTES: usize = 4 * 1024;
 static RUN_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Keyboard action understood by the terminal UI shell.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum UiAction {
     /// Move selection to the previous setting.
     MoveUp,
@@ -239,6 +239,10 @@ impl TerminalUi {
         self.render_metrics(frame, metrics);
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "terminal progress and sizes are approximate human-facing values"
+    )]
     fn render_metrics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let [live, summary] =
             Layout::vertical([Constraint::Length(7), Constraint::Min(4)]).areas(area);
@@ -368,11 +372,11 @@ impl TerminalUi {
     fn change_selected(&mut self, next: bool) {
         match self.selected {
             WORKLOAD_SETTING => {
-                self.config.workload_size = next_workload_size(self.config.workload_size, next)
+                self.config.workload_size = next_workload_size(self.config.workload_size, next);
             }
             MODE_SETTING => self.config.test_mode = next_test_mode(self.config.test_mode, next),
             LAYOUT_SETTING => {
-                self.config.file_layout = next_file_layout(self.config.file_layout, next)
+                self.config.file_layout = next_file_layout(self.config.file_layout, next);
             }
             CACHE_SETTING => self.config.cache_mode = next_cache_mode(self.config.cache_mode),
             EXECUTION_MODE_SETTING => {
@@ -380,7 +384,6 @@ impl TerminalUi {
             }
             KEEP_FILES_SETTING => self.config.keep_files = !self.config.keep_files,
             SAVE_REPORT_SETTING => self.config.save_report = !self.config.save_report,
-            TARGET_SETTING => {}
             _ => {}
         }
     }
@@ -428,6 +431,7 @@ fn pass_chart_rows(pass: &BenchmarkPassReport, width: u16) -> Vec<ListItem<'stat
     let mid_value = max / 2.0;
     let mid = chart_row(mid_value, mid_value, &points);
     let bottom = chart_row(0.0, 0.0, &points);
+    let progress_gap = " ".repeat(points.len().saturating_sub(2));
     let strip = stability_strip(&points, max);
 
     vec![
@@ -435,6 +439,7 @@ fn pass_chart_rows(pass: &BenchmarkPassReport, width: u16) -> Vec<ListItem<'stat
         ListItem::new(Line::from(top)),
         ListItem::new(Line::from(mid)),
         ListItem::new(Line::from(bottom)),
+        ListItem::new(Line::from(format!("Progress 0%{progress_gap}100%"))),
         ListItem::new(Line::from(format!("Stability {strip}"))),
     ]
 }
@@ -770,7 +775,8 @@ fn hundred_file_sizes(total_bytes: u64) -> Result<Vec<u64>, WorkloadError> {
     for (index, size_slot) in sizes.iter_mut().enumerate() {
         let weight = 95 + index as u64 % 11;
         let size =
-            (u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM)) as u64;
+            u64::try_from(u128::from(weighted_bytes) * u128::from(weight) / u128::from(WEIGHT_SUM))
+                .map_err(|_| ConfigError::WorkloadOverflow)?;
         allocated += size;
         *size_slot += size;
     }
