@@ -1,7 +1,9 @@
 //! Terminal UI entrypoint for studiofs-bench.
 
 use std::{
+    env,
     io::{self, IsTerminal},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,11 +15,17 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use studiofs_bench::{
-    BenchmarkConfig, BenchmarkRunner, BenchmarkRunnerReport, StreamingIoSample, TerminalUi,
-    UiAction,
+    BenchmarkConfig, BenchmarkPassReport, BenchmarkRunner, BenchmarkRunnerReport, CacheMode,
+    DiskTestMode, ExecutionMode, FileLayout, RunMode, StreamingIoSample, TerminalUi, UiAction,
+    Workload, WorkloadSize,
 };
 
 fn main() -> io::Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "--scripted") {
+        return run_scripted(&args[1..]).map_err(io::Error::other);
+    }
+
     if !io::stdout().is_terminal() {
         println!("studiofs-bench");
         return Ok(());
@@ -27,6 +35,180 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal);
     ratatui::restore();
     result
+}
+
+fn run_scripted(args: &[String]) -> Result<(), String> {
+    let options = ScriptedOptions::parse(args)?;
+    let runner = BenchmarkRunner::default();
+    let report = if let Some(bytes) = options.workload_bytes {
+        let workload = Workload::create_for_bytes(
+            &options.config.target_path,
+            bytes,
+            options.config.file_layout,
+        )
+        .map_err(|error| error.to_string())?;
+        runner
+            .run_workload(workload, &options.config, |_| {}, || false)
+            .map_err(|error| error.to_string())?
+    } else {
+        runner
+            .run(&options.config, |_| {}, || false)
+            .map_err(|error| error.to_string())?
+    };
+
+    if let Some(path) = &options.report_path {
+        save_reports(path, &options.config, options.workload_bytes, &report)?;
+    }
+
+    println!("Done - {} passes", report.passes.len());
+    Ok(())
+}
+
+struct ScriptedOptions {
+    config: BenchmarkConfig,
+    workload_bytes: Option<u64>,
+    report_path: Option<PathBuf>,
+}
+
+impl ScriptedOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut config = BenchmarkConfig::for_target(PathBuf::from("."));
+        config.save_report = false;
+        let mut workload_bytes = None;
+        let mut report_path = None;
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--target" => config.target_path = PathBuf::from(value_after(args, &mut index)?),
+                "--workload-gb" => {
+                    config.workload_size =
+                        WorkloadSize::CustomGb(parse_u64(value_after(args, &mut index)?)?)
+                }
+                "--workload-bytes" => {
+                    workload_bytes = Some(parse_u64(value_after(args, &mut index)?)?)
+                }
+                "--run-mode" => config.run_mode = parse_run_mode(value_after(args, &mut index)?)?,
+                "--mode" => config.test_mode = parse_test_mode(value_after(args, &mut index)?)?,
+                "--layout" => config.file_layout = parse_layout(value_after(args, &mut index)?)?,
+                "--file-size-mb" => {
+                    config.file_layout =
+                        FileLayout::FixedFileSizeMb(parse_u64(value_after(args, &mut index)?)?)
+                }
+                "--cache" => config.cache_mode = parse_cache_mode(value_after(args, &mut index)?)?,
+                "--execution" => {
+                    config.execution_mode = parse_execution_mode(value_after(args, &mut index)?)?
+                }
+                "--keep-files" => config.keep_files = true,
+                "--save-report" => {
+                    config.save_report = true;
+                    report_path = Some(PathBuf::from(value_after(args, &mut index)?));
+                }
+                value => return Err(format!("unknown argument: {value}")),
+            }
+            index += 1;
+        }
+
+        Ok(Self {
+            config,
+            workload_bytes,
+            report_path,
+        })
+    }
+}
+
+fn value_after(args: &[String], index: &mut usize) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| String::from("missing argument value"))
+}
+
+fn parse_u64(value: String) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid unsigned integer: {value}"))
+}
+
+fn parse_run_mode(value: String) -> Result<RunMode, String> {
+    match value.as_str() {
+        "local" | "local-filesystem" => Ok(RunMode::LocalFilesystem),
+        "mounted" | "mounted-filesystem" => Ok(RunMode::MountedFilesystem),
+        _ => Err(format!("invalid run mode: {value}")),
+    }
+}
+
+fn parse_test_mode(value: String) -> Result<DiskTestMode, String> {
+    match value.as_str() {
+        "read-write" => Ok(DiskTestMode::ReadWrite),
+        "write-only" => Ok(DiskTestMode::WriteOnly),
+        "write-once-read-loop" => Ok(DiskTestMode::WriteOnceReadLoop),
+        _ => Err(format!("invalid mode: {value}")),
+    }
+}
+
+fn parse_layout(value: String) -> Result<FileLayout, String> {
+    match value.as_str() {
+        "single-file" => Ok(FileLayout::SingleFile),
+        "hundred-files-plus-minus-five" => Ok(FileLayout::HundredFilesPlusMinusFive),
+        _ => Err(format!("invalid layout: {value}")),
+    }
+}
+
+fn parse_cache_mode(value: String) -> Result<CacheMode, String> {
+    match value.as_str() {
+        "enabled" => Ok(CacheMode::Enabled),
+        "disabled" => Ok(CacheMode::Disabled),
+        _ => Err(format!("invalid cache mode: {value}")),
+    }
+}
+
+fn parse_execution_mode(value: String) -> Result<ExecutionMode, String> {
+    match value.as_str() {
+        "run-once" => Ok(ExecutionMode::RunOnce),
+        "continuous" => Ok(ExecutionMode::Continuous),
+        _ => Err(format!("invalid execution mode: {value}")),
+    }
+}
+
+fn save_reports(
+    path: &std::path::Path,
+    config: &BenchmarkConfig,
+    workload_bytes: Option<u64>,
+    report: &BenchmarkRunnerReport,
+) -> Result<(), String> {
+    let json_path = path.with_extension("json");
+    let csv_path = path.with_extension("csv");
+    let payload = serde_json::json!({
+        "config": config,
+        "workload_bytes": workload_bytes,
+        "report": report,
+    });
+    let json = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
+    std::fs::write(json_path, json).map_err(|error| error.to_string())?;
+    std::fs::write(csv_path, passes_csv(&report.passes)).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn passes_csv(passes: &[BenchmarkPassReport]) -> String {
+    let mut csv = String::from(
+        "phase,pass_number,bytes_processed,stopped,sample_count,average_mb_per_second,stable_mb_per_second,minimum_mb_per_second,drop_count\n",
+    );
+    for pass in passes {
+        csv.push_str(&format!(
+            "{:?},{},{},{},{},{},{},{},{}\n",
+            pass.phase,
+            pass.pass_number,
+            pass.bytes_processed,
+            pass.stopped,
+            pass.metrics.sample_count,
+            pass.metrics.average_mb_per_second,
+            pass.metrics.stable_mb_per_second,
+            pass.metrics.minimum_mb_per_second,
+            pass.metrics.drop_count
+        ));
+    }
+    csv
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {

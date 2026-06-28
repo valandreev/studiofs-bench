@@ -12,3 +12,55 @@ fn binary_prints_name() {
     assert_eq!(output.stdout, b"studiofs-bench\n");
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn scripted_mode_runs_tiny_benchmark_and_saves_reports() {
+    let dir = TestDir::new("studiofs-bench-sfs-578-scripted");
+    let report = dir.path().join("report");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_studiofs-bench"))
+        .arg("--scripted")
+        .arg("--target")
+        .arg(dir.path())
+        .arg("--workload-bytes")
+        .arg("8")
+        .arg("--mode")
+        .arg("write-only")
+        .arg("--layout")
+        .arg("single-file")
+        .arg("--cache")
+        .arg("enabled")
+        .arg("--save-report")
+        .arg(&report)
+        .output()
+        .expect("run scripted studiofs-bench");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Done - 1 passes"));
+    assert!(output.stderr.is_empty());
+    assert!(report.with_extension("json").exists());
+    assert!(report.with_extension("csv").exists());
+}
+
+struct TestDir {
+    path: std::path::PathBuf,
+}
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
