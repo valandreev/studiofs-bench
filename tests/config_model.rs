@@ -19,7 +19,7 @@ fn default_config_uses_documented_benchmark_contract() {
     assert_eq!(config.file_layout, FileLayout::SingleFile);
     assert_eq!(config.cache_mode, CacheMode::Enabled);
     assert!(!config.keep_files);
-    assert!(config.save_report);
+    assert!(!config.save_report);
     assert_eq!(config.execution_mode, ExecutionMode::RunOnce);
     assert_eq!(BenchmarkConfig::THROUGHPUT_UNIT, "MB/s");
     assert_eq!(config.validate(), Ok(()));

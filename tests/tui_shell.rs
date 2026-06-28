@@ -47,7 +47,7 @@ fn terminal_ui_edits_selected_settings_from_keyboard_actions() {
     assert_eq!(config.cache_mode, CacheMode::Disabled);
     assert_eq!(config.execution_mode, ExecutionMode::Continuous);
     assert!(config.keep_files);
-    assert!(!config.save_report);
+    assert!(config.save_report);
 }
 
 #[test]
