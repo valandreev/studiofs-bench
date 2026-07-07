@@ -1,6 +1,5 @@
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -14,7 +13,7 @@ use ratatui::{
 };
 use serde::Serialize;
 
-use crate::runner_streaming::{MetricsAccumulator, chunk_len, fill_benchmark_buffer};
+use crate::runner_streaming::MetricsAccumulator;
 use crate::{BenchmarkPassReport, StreamingIoPhase, StreamingIoSample};
 
 pub(crate) const DECIMAL_MB: u64 = 1_000_000;
@@ -712,7 +711,7 @@ impl Workload {
         Self::create_for_bytes(&config.target_path, total_bytes, config.file_layout)
     }
 
-    /// Creates workload files with an explicit byte size.
+    /// Creates workload metadata with an explicit byte size.
     ///
     /// # Errors
     ///
@@ -726,11 +725,7 @@ impl Workload {
         let target_path = target_path.as_ref();
         let file_sizes = workload_file_sizes(total_bytes, file_layout)?;
         let run_dir = create_unique_run_dir(target_path)?;
-        let max_file_size = file_sizes.iter().copied().max().unwrap_or(0);
-        let buffer = benchmark_buffer(max_file_size);
-        let files = write_workload_files(&run_dir, file_sizes, |path, bytes| {
-            write_workload_file(path, bytes, &buffer)
-        })?;
+        let files = plan_workload_files(&run_dir, file_sizes);
 
         Ok(Self { run_dir, files })
     }
@@ -874,45 +869,15 @@ fn create_unique_run_dir(target_path: &Path) -> Result<PathBuf, WorkloadError> {
     Ok(path)
 }
 
-fn write_workload_files(
-    run_dir: &Path,
-    file_sizes: Vec<u64>,
-    mut write_file: impl FnMut(&Path, u64) -> Result<(), WorkloadError>,
-) -> Result<Vec<WorkloadFile>, WorkloadError> {
+fn plan_workload_files(run_dir: &Path, file_sizes: Vec<u64>) -> Vec<WorkloadFile> {
     let mut files = Vec::with_capacity(file_sizes.len());
 
     for (index, bytes) in file_sizes.into_iter().enumerate() {
         let path = run_dir.join(format!("studiofs-bench-workload-{index:03}.bin"));
-        if let Err(error) = write_file(&path, bytes) {
-            let _ = std::fs::remove_dir_all(run_dir);
-            return Err(error);
-        }
         files.push(WorkloadFile { path, bytes });
     }
 
-    Ok(files)
-}
-
-fn benchmark_buffer(total_bytes: u64) -> Vec<u8> {
-    let buffer_size = usize::try_from(total_bytes)
-        .unwrap_or(DEFAULT_STREAMING_BLOCK_BYTES)
-        .min(DEFAULT_STREAMING_BLOCK_BYTES);
-    let mut buffer = vec![0_u8; buffer_size];
-    fill_benchmark_buffer(&mut buffer);
-    buffer
-}
-
-fn write_workload_file(path: &Path, file_size: u64, buffer: &[u8]) -> Result<(), WorkloadError> {
-    let mut file = File::create(path).map_err(|error| path_io_error(path, error))?;
-    let mut written = 0_u64;
-    while written < file_size {
-        let chunk = chunk_len(buffer.len(), file_size - written);
-        file.write_all(&buffer[..chunk])
-            .map_err(|error| path_io_error(path, error))?;
-        written += chunk as u64;
-    }
-
-    Ok(())
+    files
 }
 
 fn path_io_error(path: &Path, source: io::Error) -> WorkloadError {

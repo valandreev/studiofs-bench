@@ -126,7 +126,7 @@ fn runner_stops_between_files_without_truncating_next_file() {
         .unwrap();
 
     assert!(report.stopped);
-    assert_eq!(std::fs::metadata(second_file).unwrap().len(), 1);
+    assert!(!second_file.exists());
 }
 
 #[test]

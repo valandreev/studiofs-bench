@@ -105,7 +105,7 @@ fn config_serializes_report_ready_values() {
 }
 
 #[test]
-fn workload_create_for_bytes_writes_single_file_under_unique_run_dir() {
+fn workload_create_for_bytes_plans_single_file_under_unique_run_dir() {
     let target = TestDir::new("studiofs-bench-sfs-572-single");
 
     let workload = Workload::create_for_bytes(target.path(), 17, FileLayout::SingleFile).unwrap();
@@ -118,16 +118,7 @@ fn workload_create_for_bytes_writes_single_file_under_unique_run_dir() {
             .path
             .ends_with("studiofs-bench-workload-000.bin")
     );
-    assert_eq!(
-        std::fs::metadata(&workload.files()[0].path).unwrap().len(),
-        17
-    );
-    assert!(
-        std::fs::read(&workload.files()[0].path)
-            .unwrap()
-            .iter()
-            .any(|byte| *byte != 0)
-    );
+    assert!(!workload.files()[0].path.exists());
 
     let user_file = target.path().join("user-file.txt");
     std::fs::write(&user_file, b"keep").unwrap();
@@ -140,7 +131,7 @@ fn workload_create_for_bytes_writes_single_file_under_unique_run_dir() {
 }
 
 #[test]
-fn workload_create_for_bytes_writes_100_varied_files_with_exact_total_size() {
+fn workload_create_for_bytes_plans_100_varied_files_with_exact_total_size() {
     let target = TestDir::new("studiofs-bench-sfs-572-100");
 
     let workload =
@@ -149,13 +140,14 @@ fn workload_create_for_bytes_writes_100_varied_files_with_exact_total_size() {
     let sizes = workload
         .files()
         .iter()
-        .map(|file| std::fs::metadata(&file.path).unwrap().len())
+        .map(|file| file.bytes)
         .collect::<Vec<_>>();
 
     assert_eq!(sizes.len(), 100);
     assert_eq!(sizes.iter().sum::<u64>(), 10_000);
     assert!(sizes.iter().all(|size| (95..=105).contains(size)));
     assert!(sizes.windows(2).any(|pair| pair[0] != pair[1]));
+    assert!(workload.files().iter().all(|file| !file.path.exists()));
     assert!(
         workload
             .files()

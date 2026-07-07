@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::runner_streaming::{chunk_len, fill_benchmark_buffer};
 
 #[test]
 fn chunk_len_keeps_large_remaining_sizes_in_u64_until_after_min() {
@@ -61,7 +62,7 @@ fn cleanup_error_includes_run_dir_path() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&run_dir);
-    File::create(&run_dir).unwrap();
+    std::fs::File::create(&run_dir).unwrap();
     let workload = Workload {
         run_dir: run_dir.clone(),
         files: Vec::new(),
@@ -74,42 +75,6 @@ fn cleanup_error_includes_run_dir_path() {
     };
     assert_eq!(path, run_dir);
     let _ = std::fs::remove_file(&run_dir);
-}
-
-#[test]
-fn write_workload_files_removes_run_dir_when_file_write_fails() {
-    let run_dir = std::env::temp_dir().join(format!(
-        "studiofs-bench-sfs-572-partial-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&run_dir);
-    std::fs::create_dir_all(&run_dir).unwrap();
-
-    let error = write_workload_files(&run_dir, vec![1, 2], |path, bytes| {
-        if bytes == 2 {
-            return Err(std::io::Error::other("write failed").into());
-        }
-        File::create(path)?;
-        Ok(())
-    })
-    .unwrap_err();
-
-    assert_eq!(error.to_string(), "write failed");
-    assert!(!run_dir.exists());
-}
-
-#[test]
-fn write_workload_file_uses_supplied_buffer() {
-    let path = std::env::temp_dir().join(format!(
-        "studiofs-bench-sfs-572-buffer-{}.bin",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-
-    write_workload_file(&path, 5, &[1, 2, 3]).unwrap();
-
-    assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 1, 2]);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
