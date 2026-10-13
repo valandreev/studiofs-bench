@@ -893,7 +893,7 @@ fn path_io_error(path: &Path, source: io::Error) -> WorkloadError {
 pub enum CacheMode {
     /// Run with normal platform file I/O.
     Enabled,
-    /// Attempt standard best-effort cache-reduced platform I/O.
+    /// Bypass the OS file-data cache, or fail if unsupported.
     Disabled,
 }
 
@@ -903,14 +903,14 @@ pub enum CacheMode {
 pub enum CacheControlMethod {
     /// Normal platform file I/O.
     NormalFileIo,
-    /// Windows write-through file flag.
-    WriteThrough,
+    /// Windows `FILE_FLAG_NO_BUFFERING` file flag.
+    NoBuffering,
     /// macOS `F_NOCACHE` file descriptor flag.
     FcntlNoCache,
-    /// Linux `posix_fadvise(..., POSIX_FADV_DONTNEED)` hints.
-    PosixFadviseDontNeed,
-    /// No standard per-file best-effort method is implemented for this target.
-    BestEffortUnavailable,
+    /// Linux `O_DIRECT` file flag.
+    DirectIo,
+    /// Uncached I/O is not implemented for this target; non-empty runs fail.
+    Unsupported,
 }
 
 /// Execution lifetime for the benchmark runner.

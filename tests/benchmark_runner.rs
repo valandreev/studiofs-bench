@@ -152,6 +152,37 @@ fn runner_reports_pass_progress_and_metrics_from_samples() {
 }
 
 #[test]
+fn runner_batch_fsync_preserves_logical_progress_and_sample_count() {
+    let target = TestDir::new("studiofs-bench-batch-fsync-progress");
+    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
+    config.test_mode = DiskTestMode::WriteOnly;
+    config.file_layout = FileLayout::HundredFilesPlusMinusFive;
+    let workload =
+        Workload::create_for_bytes(target.path(), 100, FileLayout::HundredFilesPlusMinusFive)
+            .unwrap();
+    let expected_samples = workload.files().len();
+    let mut samples = Vec::new();
+
+    let report = BenchmarkRunner::with_block_size(200)
+        .unwrap()
+        .run_workload(workload, &config, |sample| samples.push(sample), || false)
+        .unwrap();
+
+    assert_eq!(report.passes[0].bytes_processed, 100);
+    assert_eq!(samples.len(), expected_samples);
+    assert_eq!(
+        report.passes[0].metrics.sample_count,
+        u64::try_from(expected_samples).unwrap()
+    );
+    assert_eq!(report.passes[0].throughput_samples.len(), expected_samples);
+    assert_eq!(samples.last().unwrap().bytes_processed, 100);
+    assert!(samples.windows(2).all(|pair| {
+        pair[0].bytes_processed < pair[1].bytes_processed
+            && pair[0].elapsed_io <= pair[1].elapsed_io
+    }));
+}
+
+#[test]
 fn runner_includes_completed_pass_samples_for_terminal_charts() {
     let target = TestDir::new("studiofs-bench-sfs-576-chart-samples");
     let mut config = BenchmarkConfig::for_target(target.path().to_owned());
@@ -167,10 +198,44 @@ fn runner_includes_completed_pass_samples_for_terminal_charts() {
 }
 
 #[test]
+fn runner_does_not_complete_write_pass_when_batch_sync_fails() {
+    let target = TestDir::new("studiofs-bench-batch-fsync-error");
+    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
+    config.test_mode = DiskTestMode::WriteOnly;
+    config.file_layout = FileLayout::HundredFilesPlusMinusFive;
+    let workload =
+        Workload::create_for_bytes(target.path(), 100, FileLayout::HundredFilesPlusMinusFive)
+            .unwrap();
+    let first_file = workload.files()[0].path.clone();
+    let second_file_start_offset = workload.files()[0].bytes;
+    let mut emitted_byte_counts = Vec::new();
+
+    let error = BenchmarkRunner::with_block_size(200)
+        .unwrap()
+        .run_workload(
+            workload,
+            &config,
+            |sample| {
+                if sample.offset == second_file_start_offset {
+                    std::fs::remove_file(&first_file).unwrap();
+                }
+                emitted_byte_counts.push(sample.bytes_processed);
+            },
+            || false,
+        )
+        .unwrap_err();
+
+    let BenchmarkRunnerError::RunFailed { partial_report, .. } = error else {
+        panic!("runner error should include a partial report: {error}");
+    };
+    assert!(partial_report.passes.is_empty());
+    assert!(!emitted_byte_counts.contains(&100));
+}
+
+#[test]
 fn runner_error_exposes_completed_passes_after_later_phase_fails() {
     let target = TestDir::new("studiofs-bench-sfs-579-partial-error");
-    let mut config = BenchmarkConfig::for_target(target.path().to_owned());
-    config.batch_fsync = false;
+    let config = BenchmarkConfig::for_target(target.path().to_owned());
     let workload = Workload::create_for_bytes(target.path(), 4, FileLayout::SingleFile).unwrap();
     let file = workload.files()[0].path.clone();
 

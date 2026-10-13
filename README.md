@@ -77,7 +77,8 @@ The I/O engine is one dense sequential streaming engine. It uses an internal
 8 MB block size for normal runs, fills write buffers with deterministic non-zero
 data, and samples throughput after completed blocks. The final write block is
 synced before the write pass completes when `Batch fsync` is disabled. By
-default, write fsync is batched until the end of the write file sequence.
+default, every written file is synced after the write file sequence. Sync time
+is included in the final write throughput.
 
 ## Interactive Controls
 
@@ -103,8 +104,8 @@ Settings are locked while a run is active.
 - `Layout`: `single file` stores the workload in one file. `100 files +/-5%`
   splits it into 100 deterministic files with slight size variance. Scripted
   mode also accepts `--file-size-mb <n>` for fixed-size files.
-- `Cache mode`: `enabled` uses normal file I/O. `disabled` requests best-effort
-  cache-reduced I/O for the platform.
+- `Cache mode`: `enabled` uses normal file I/O. `disabled` bypasses the OS
+  file-data cache and fails if the target cannot support the required method.
 - `Batch fsync`: enabled by default. When enabled, write fsync is delayed until
   the end of the write file sequence. When disabled, each written file is synced
   before that file completes.
@@ -155,12 +156,22 @@ completed pass data and show the cleanup error.
 
 `enabled` uses normal platform file I/O.
 
-`disabled` is best-effort and platform-specific:
+`disabled` bypasses the OS file-data cache using a platform-specific method:
 
-- Windows: opens files with the write-through file flag.
-- macOS: sets `F_NOCACHE` on the file descriptor.
-- Linux: calls `posix_fadvise(..., POSIX_FADV_DONTNEED)` after file I/O.
-- Other targets: records that a best-effort method is unavailable.
+- Windows: opens files with `FILE_FLAG_NO_BUFFERING` and queries sector sizes.
+- macOS: sets `F_NOCACHE` and checks that the operation succeeds.
+- Linux: opens files with `O_DIRECT` and queries `STATX_DIOALIGN`. This mode
+  requires Linux 6.1 or newer and a filesystem that reports direct I/O alignment.
+- Other targets: uncached runs fail with an unsupported-operation error.
+
+Windows and Linux buffers, request lengths, and offsets are aligned to the
+target's requirements. The last write may include alignment padding; the file
+is truncated to its requested size before syncing. Reports count workload bytes,
+not padding. Small workloads can therefore have proportionally more I/O overhead.
+
+There is no fallback to cached I/O. This setting does not disable hardware
+caches, remote-server caches, or caching inside a mounted filesystem service.
+With caching enabled, reads after writes may be served from the OS cache.
 
 Cache controls are not identical across operating systems. Compare runs only
 when the cache mode, target path, and machine setup are the same.
@@ -168,9 +179,13 @@ when the cache mode, target path, and machine setup are the same.
 ## Write Sync Behavior
 
 `Batch fsync` is enabled by default. The runner writes all files in the write
-sequence first, then performs one final sync before the write pass is complete.
-This matches file-manager style copy behavior more closely than syncing after
-every file.
+sequence first, then syncs every file that received data before the write pass
+is complete. A stopped pass also syncs files that received data. A sync failure
+fails the pass.
+
+Each completed pass average is total workload bytes processed divided by measured
+I/O time, including sync time for writes. The final write sample includes the batch sync time.
+Callback/UI time and file preparation are excluded from measured I/O time.
 
 Pass `--no-batch-fsync` or disable `Batch fsync` in the UI when you need the
 legacy behavior where every written file is synced as soon as it completes.
@@ -212,7 +227,8 @@ read,1,0,118.9
 
 The UI and reports show:
 
-- `Avg`: average sample throughput for the pass.
+- `Avg`: total bytes divided by measured I/O time for a completed pass,
+  including all file syncs for writes. Live summaries use average sample throughput.
 - `Stable`: average excluding samples that dropped below the previous sample.
 - `Min`: lowest sample throughput.
 - `Drops`: count of samples lower than the previous sample.

@@ -113,6 +113,7 @@ fn finish_completed_run_drains_final_samples_before_clearing_run() {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             offset: 0,
             bytes_processed: 500_000_000,
+            elapsed_io: std::time::Duration::ZERO,
             mb_per_second: 125.0,
         })
         .unwrap();
@@ -140,6 +141,7 @@ fn finish_completed_run_preserves_pass_summaries_when_run_errors() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 1_000_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 100.0,
     });
     ui.observe_sample(StreamingIoSample {
@@ -148,6 +150,7 @@ fn finish_completed_run_preserves_pass_summaries_when_run_errors() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 500_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 80.0,
     });
     let stop = Arc::new(AtomicBool::new(false));
