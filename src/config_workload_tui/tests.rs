@@ -88,6 +88,7 @@ fn terminal_ui_updates_unknown_total_bytes_from_later_samples() {
         timestamp: SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 0,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 0.0,
     });
     ui.observe_sample(StreamingIoSample {
@@ -96,6 +97,7 @@ fn terminal_ui_updates_unknown_total_bytes_from_later_samples() {
         timestamp: SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 10 * DECIMAL_MB,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 100.0,
     });
 

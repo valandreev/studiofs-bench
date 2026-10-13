@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Serialize;
@@ -15,6 +17,8 @@ use crate::{
     DEFAULT_STREAMING_BLOCK_BYTES, DiskTestMode, ExecutionMode, Workload, WorkloadError,
     WorkloadFile,
 };
+
+mod cache_io;
 
 /// Runs benchmark workloads according to [`BenchmarkConfig`].
 #[derive(Debug, Copy, Clone, Default)]
@@ -193,6 +197,10 @@ impl BenchmarkRunner {
         let mut bytes_processed = 0;
         let mut stopped = false;
         let mut metrics = MetricsAccumulator::default();
+        let mut elapsed_io = Duration::ZERO;
+        let mut touched_paths = Vec::new();
+        let mut last_write_sample = None;
+        let mut deferred_final_sample = None;
         let max_file_bytes = files.iter().map(|file| file.bytes).max().unwrap_or(0);
         let mut buffer = self.engine.buffer_for_bytes(max_file_bytes);
         let mut throughput_samples = Vec::with_capacity(sample_capacity(files, buffer.len()));
@@ -200,19 +208,34 @@ impl BenchmarkRunner {
             fill_benchmark_buffer(&mut buffer);
         }
 
-        for file in files {
+        for (file_index, file) in files.iter().enumerate() {
             if should_stop() {
                 stopped = true;
                 break;
             }
 
+            let mut file_elapsed_io = Duration::ZERO;
             let report = {
                 let mut observe_sample = |mut sample: StreamingIoSample| {
+                    let file_bytes_processed = sample.bytes_processed;
                     sample.offset += bytes_processed;
                     sample.bytes_processed += bytes_processed;
-                    metrics.add(sample.mb_per_second);
-                    throughput_samples.push(sample.mb_per_second);
-                    on_sample(sample);
+                    sample.elapsed_io += elapsed_io;
+                    sample.mb_per_second =
+                        sample_throughput(sample.bytes_processed, sample.elapsed_io);
+                    file_elapsed_io = sample.elapsed_io - elapsed_io;
+                    if phase == StreamingIoPhase::Write
+                        && config.batch_fsync
+                        && file_index == files.len() - 1
+                        && file_bytes_processed == file.bytes
+                    {
+                        deferred_final_sample = Some(sample);
+                    } else {
+                        last_write_sample = Some(sample);
+                        metrics.add(sample.mb_per_second);
+                        throughput_samples.push(sample.mb_per_second);
+                        on_sample(sample);
+                    }
                 };
                 match phase {
                     StreamingIoPhase::Write => StreamingIoEngine::write_with_buffer(
@@ -246,17 +269,37 @@ impl BenchmarkRunner {
                 StreamingIoPhase::Read => report.bytes_read,
             };
             stopped = report.stopped;
+
+            elapsed_io += file_elapsed_io;
+            if phase == StreamingIoPhase::Write && config.batch_fsync && report.bytes_written > 0 {
+                touched_paths.push(file.path.as_path());
+            }
             if stopped {
                 break;
             }
         }
 
-        if phase == StreamingIoPhase::Write
-            && config.batch_fsync
-            && !stopped
-            && let Some(file) = files.last()
-        {
-            sync_path(&file.path)?;
+        if phase == StreamingIoPhase::Write && config.batch_fsync {
+            for path in touched_paths {
+                let sync_started = Instant::now();
+                sync_path(path)?;
+                elapsed_io += measured_sync_elapsed(sync_started);
+            }
+            let final_sample =
+                deferred_final_sample.or(if stopped { last_write_sample } else { None });
+            if let Some(mut sample) = final_sample {
+                sample.elapsed_io = elapsed_io;
+                sample.timestamp = SystemTime::now();
+                sample.mb_per_second = sample_throughput(sample.bytes_processed, elapsed_io);
+                metrics.add(sample.mb_per_second);
+                throughput_samples.push(sample.mb_per_second);
+                on_sample(sample);
+            }
+        }
+
+        let mut metrics = metrics.finish();
+        if bytes_processed > 0 {
+            metrics.average_mb_per_second = sample_throughput(bytes_processed, elapsed_io);
         }
 
         Ok(BenchmarkPassReport {
@@ -264,7 +307,7 @@ impl BenchmarkRunner {
             pass_number,
             bytes_processed,
             stopped,
-            metrics: metrics.finish(),
+            metrics,
             throughput_samples,
         })
     }
@@ -369,7 +412,7 @@ pub struct BenchmarkPassReport {
 pub struct BenchmarkPassMetrics {
     /// Number of samples included in the metrics.
     pub sample_count: u64,
-    /// Mean sample throughput in decimal MB/s.
+    /// Total processed bytes divided by measured I/O time for a completed pass.
     pub average_mb_per_second: f64,
     /// Mean throughput excluding samples lower than the previous sample.
     pub stable_mb_per_second: f64,
@@ -544,9 +587,20 @@ impl StreamingIoEngine {
         let mut report = empty_streaming_report(pass.cache_mode);
 
         let mut output = create_file(pass.path, pass.cache_mode)?;
-        report.bytes_written = stream_write(pass, &mut output, buffer, on_sample, should_stop)?;
-
-        after_cache_io(&output, pass.cache_mode);
+        let alignment = cache_io::alignment(&output, pass.cache_mode)
+            .map_err(|error| path_io_error(pass.path, error))?;
+        let mut aligned;
+        let buffer = if alignment > 1 {
+            aligned = cache_io::AlignedBuffer::new(buffer.len(), alignment)
+                .map_err(|error| path_io_error(pass.path, error))?;
+            let buffer = aligned.as_mut_slice();
+            fill_benchmark_buffer(buffer);
+            buffer
+        } else {
+            buffer
+        };
+        report.bytes_written =
+            stream_write(pass, &mut output, buffer, alignment, on_sample, should_stop)?;
         report.stopped = report.bytes_written < pass.total_bytes;
 
         Ok(report)
@@ -594,16 +648,18 @@ impl StreamingIoEngine {
         let mut report = empty_streaming_report(pass.cache_mode);
 
         let mut input = open_file(pass.path, pass.cache_mode)?;
-        report.bytes_read = stream_read(
-            pass.path,
-            &mut input,
-            buffer,
-            pass.total_bytes,
-            pass.pass_number,
-            on_sample,
-            should_stop,
-        )?;
-        after_cache_io(&input, pass.cache_mode);
+        let alignment = cache_io::alignment(&input, pass.cache_mode)
+            .map_err(|error| path_io_error(pass.path, error))?;
+        let mut aligned;
+        let buffer = if alignment > 1 {
+            aligned = cache_io::AlignedBuffer::new(buffer.len(), alignment)
+                .map_err(|error| path_io_error(pass.path, error))?;
+            aligned.as_mut_slice()
+        } else {
+            buffer
+        };
+        report.bytes_read =
+            stream_read(pass, &mut input, buffer, alignment, on_sample, should_stop)?;
         report.stopped = report.bytes_read < pass.total_bytes;
 
         Ok(report)
@@ -639,22 +695,22 @@ fn empty_streaming_report(cache_mode: CacheMode) -> StreamingIoReport {
 fn create_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    apply_open_options(&mut options, mode);
+    cache_io::configure_options(&mut options, mode).map_err(|error| path_io_error(path, error))?;
     let file = options
         .open(path)
         .map_err(|error| path_io_error(path, error))?;
-    apply_file_options(&file, mode);
+    cache_io::configure_file(&file, mode).map_err(|error| path_io_error(path, error))?;
     Ok(file)
 }
 
 fn open_file(path: &std::path::Path, mode: CacheMode) -> Result<File, StreamingIoError> {
     let mut options = OpenOptions::new();
     options.read(true);
-    apply_open_options(&mut options, mode);
+    cache_io::configure_options(&mut options, mode).map_err(|error| path_io_error(path, error))?;
     let file = options
         .open(path)
         .map_err(|error| path_io_error(path, error))?;
-    apply_file_options(&file, mode);
+    cache_io::configure_file(&file, mode).map_err(|error| path_io_error(path, error))?;
     Ok(file)
 }
 
@@ -675,55 +731,13 @@ fn sync_path(path: &Path) -> Result<(), StreamingIoError> {
 }
 
 fn sync_file(path: &Path, file: &File) -> Result<(), StreamingIoError> {
-    note_sync_call();
+    note_sync_call(path);
     file.sync_all().map_err(|error| path_io_error(path, error))
 }
 
 #[cfg(windows)]
-fn apply_open_options(options: &mut OpenOptions, mode: CacheMode) {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
-
-    if mode == CacheMode::Disabled {
-        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
-    }
-}
-
-#[cfg(not(windows))]
-fn apply_open_options(_: &mut OpenOptions, _: CacheMode) {}
-
-#[cfg(target_os = "macos")]
-fn apply_file_options(file: &File, mode: CacheMode) {
-    use std::os::fd::AsRawFd;
-
-    if mode == CacheMode::Disabled {
-        // SAFETY: `file` owns a valid file descriptor and `F_NOCACHE` expects an int flag.
-        // Errors are ignored because disabled cache mode is best-effort.
-        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn apply_file_options(_: &File, _: CacheMode) {}
-
-#[cfg(target_os = "linux")]
-fn after_cache_io(file: &File, mode: CacheMode) {
-    use std::os::fd::AsRawFd;
-
-    if mode == CacheMode::Disabled {
-        // SAFETY: `file` owns a valid file descriptor. This is an advisory best-effort hint.
-        // Errors are ignored because disabled cache mode is best-effort.
-        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn after_cache_io(_: &File, _: CacheMode) {}
-
-#[cfg(windows)]
 fn disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::WriteThrough
+    CacheControlMethod::NoBuffering
 }
 
 #[cfg(target_os = "macos")]
@@ -733,18 +747,19 @@ fn disabled_cache_method() -> CacheControlMethod {
 
 #[cfg(target_os = "linux")]
 fn disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::PosixFadviseDontNeed
+    CacheControlMethod::DirectIo
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::BestEffortUnavailable
+    CacheControlMethod::Unsupported
 }
 
 fn stream_write(
     pass: StreamingIoPass<'_>,
     output: &mut File,
     buffer: &mut [u8],
+    alignment: usize,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
@@ -759,11 +774,30 @@ fn stream_write(
         let offset = processed;
         let chunk = chunk_len(buffer.len(), pass.total_bytes - processed);
         let is_final_chunk = processed + chunk as u64 == pass.total_bytes;
-        stamp_block_offset(&mut buffer[..chunk], offset);
-        let io_start = Instant::now();
-        output
-            .write_all(&buffer[..chunk])
+        let transfer_len = cache_io::rounded_len(chunk, alignment)
             .map_err(|error| path_io_error(pass.path, error))?;
+        stamp_block_offset(&mut buffer[..chunk], offset);
+        buffer[chunk..transfer_len].fill(0);
+        let io_start = Instant::now();
+        if alignment == 1 {
+            output
+                .write_all(&buffer[..chunk])
+                .map_err(|error| path_io_error(pass.path, error))?;
+        } else {
+            let written = retry_interrupted(|| output.write(&buffer[..transfer_len]))
+                .map_err(|error| path_io_error(pass.path, error))?;
+            if written != transfer_len {
+                return Err(path_io_error(
+                    pass.path,
+                    io::Error::new(io::ErrorKind::WriteZero, "short direct I/O write"),
+                ));
+            }
+            if is_final_chunk && transfer_len != chunk {
+                output
+                    .set_len(pass.total_bytes)
+                    .map_err(|error| path_io_error(pass.path, error))?;
+            }
+        }
         if pass.sync_on_complete && is_final_chunk {
             sync_file(pass.path, output)?;
         }
@@ -783,18 +817,51 @@ fn stream_write(
 
 #[cfg(test)]
 static SYNC_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static SYNC_OBSERVATION_DIRECTORY: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static SYNC_PATH_OBSERVATIONS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static SYNC_FILE_LENGTH_OBSERVATIONS: std::sync::Mutex<Vec<Vec<(PathBuf, u64)>>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+std::thread_local! {
+    static SYNC_ELAPSED_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
 
 #[cfg(test)]
-fn note_sync_call() {
+fn note_sync_call(path: &Path) {
     SYNC_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if SYNC_OBSERVATION_DIRECTORY.lock().unwrap().as_deref() == path.parent() {
+        let mut file_lengths = Vec::new();
+        if let Some(directory) = path.parent()
+            && let Ok(entries) = std::fs::read_dir(directory)
+        {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata()
+                    && metadata.is_file()
+                {
+                    file_lengths.push((entry.path(), metadata.len()));
+                }
+            }
+        }
+        file_lengths.sort_by(|left, right| left.0.cmp(&right.0));
+        SYNC_PATH_OBSERVATIONS.lock().unwrap().push(path.to_owned());
+        SYNC_FILE_LENGTH_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .push(file_lengths);
+    }
 }
 
 #[cfg(not(test))]
-fn note_sync_call() {}
+fn note_sync_call(_: &Path) {}
 
 #[cfg(test)]
 fn reset_sync_call_count() {
     SYNC_CALL_COUNT.store(0, Ordering::Relaxed);
+    SYNC_PATH_OBSERVATIONS.lock().unwrap().clear();
+    SYNC_FILE_LENGTH_OBSERVATIONS.lock().unwrap().clear();
 }
 
 #[cfg(test)]
@@ -802,15 +869,40 @@ fn sync_call_count() -> usize {
     SYNC_CALL_COUNT.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+fn set_sync_observation_directory(directory: Option<PathBuf>) {
+    *SYNC_OBSERVATION_DIRECTORY.lock().unwrap() = directory;
+}
+
+#[cfg(test)]
+fn set_sync_elapsed_override(elapsed: Option<Duration>) {
+    SYNC_ELAPSED_OVERRIDE.with(|override_duration| override_duration.set(elapsed));
+}
+
+fn measured_sync_elapsed(started: Instant) -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(elapsed) = SYNC_ELAPSED_OVERRIDE.with(Cell::get) {
+            return elapsed;
+        }
+    }
+    started.elapsed()
+}
+
 fn stream_read(
-    path: &Path,
+    pass: StreamingIoPass<'_>,
     input: &mut File,
     buffer: &mut [u8],
-    total_bytes: u64,
-    pass_number: u64,
+    alignment: usize,
     on_sample: &mut impl FnMut(StreamingIoSample),
     should_stop: &mut impl FnMut() -> bool,
 ) -> Result<u64, StreamingIoError> {
+    let StreamingIoPass {
+        path,
+        total_bytes,
+        pass_number,
+        ..
+    } = pass;
     let mut elapsed_io = Duration::ZERO;
     let mut processed = 0;
 
@@ -821,10 +913,23 @@ fn stream_read(
 
         let offset = processed;
         let chunk = chunk_len(buffer.len(), total_bytes - processed);
+        let transfer_len =
+            cache_io::rounded_len(chunk, alignment).map_err(|error| path_io_error(path, error))?;
         let io_start = Instant::now();
-        input
-            .read_exact(&mut buffer[..chunk])
-            .map_err(|error| path_io_error(path, error))?;
+        if alignment == 1 {
+            input
+                .read_exact(&mut buffer[..chunk])
+                .map_err(|error| path_io_error(path, error))?;
+        } else {
+            let read = retry_interrupted(|| input.read(&mut buffer[..transfer_len]))
+                .map_err(|error| path_io_error(path, error))?;
+            if read < chunk {
+                return Err(path_io_error(
+                    path,
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "short direct I/O read"),
+                ));
+            }
+        }
         elapsed_io += io_start.elapsed();
         processed += chunk as u64;
         on_sample(sample(
@@ -845,6 +950,15 @@ pub(crate) fn chunk_len(block_size: usize, remaining: u64) -> usize {
         .min(block_size)
 }
 
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 pub(crate) fn fill_benchmark_buffer(buffer: &mut [u8]) {
     let mut state = 0x1234_5678_u32;
 
@@ -854,10 +968,6 @@ pub(crate) fn fill_benchmark_buffer(buffer: &mut [u8]) {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "throughput is an approximate human-facing metric"
-)]
 fn sample(
     phase: StreamingIoPhase,
     pass_number: u64,
@@ -865,16 +975,23 @@ fn sample(
     bytes_processed: u64,
     elapsed_io: Duration,
 ) -> StreamingIoSample {
-    let elapsed = elapsed_io.as_secs_f64().max(f64::EPSILON);
-
     StreamingIoSample {
         phase,
         pass_number,
         timestamp: SystemTime::now(),
         offset,
         bytes_processed,
-        mb_per_second: bytes_processed as f64 / DECIMAL_MB as f64 / elapsed,
+        mb_per_second: sample_throughput(bytes_processed, elapsed_io),
+        elapsed_io,
     }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "throughput is an approximate human-facing metric"
+)]
+fn sample_throughput(bytes_processed: u64, elapsed_io: Duration) -> f64 {
+    bytes_processed as f64 / DECIMAL_MB as f64 / elapsed_io.as_secs_f64().max(f64::EPSILON)
 }
 
 /// Sequential streaming phase.
@@ -900,6 +1017,8 @@ pub struct StreamingIoSample {
     pub offset: u64,
     /// Cumulative bytes processed in the current phase.
     pub bytes_processed: u64,
+    /// Cumulative time spent in benchmark I/O, excluding sample callbacks.
+    pub elapsed_io: Duration,
     /// Current cumulative throughput in decimal MB/s.
     pub mb_per_second: f64,
 }

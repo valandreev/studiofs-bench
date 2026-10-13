@@ -1,5 +1,18 @@
 # Release Notes
 
+## Unreleased
+
+### Fixed
+
+- Cache-disabled runs bypass the OS file-data cache with Windows
+  `FILE_FLAG_NO_BUFFERING`, Linux `O_DIRECT`, or checked macOS `F_NOCACHE`.
+  Unsupported targets fail instead of silently using cached I/O. Linux requires
+  a filesystem that reports `STATX_DIOALIGN` on Linux 6.1 or newer.
+- Uncached transfers handle small files and unaligned tails while preserving
+  requested file sizes and logical byte counts.
+- Batch fsync syncs all written files after the write sequence and includes
+  their sync time in the final write sample and write pass average.
+
 ## 0.1.0 - First Working Version
 
 First working `studiofs-bench` release.

@@ -418,7 +418,7 @@ fn cache_method_label(cache_mode: CacheMode) -> &'static str {
 
 #[cfg(windows)]
 fn disabled_cache_method_label() -> &'static str {
-    "write_through"
+    "no_buffering"
 }
 
 #[cfg(target_os = "macos")]
@@ -428,12 +428,12 @@ fn disabled_cache_method_label() -> &'static str {
 
 #[cfg(target_os = "linux")]
 fn disabled_cache_method_label() -> &'static str {
-    "posix_fadvise_dont_need"
+    "direct_io"
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn disabled_cache_method_label() -> &'static str {
-    "best_effort_unavailable"
+    "unsupported"
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {

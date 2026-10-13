@@ -139,6 +139,7 @@ fn terminal_ui_renders_live_progress_and_pass_summary_metrics() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 500_000_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 125.0,
     });
     ui.finish_run_with_passes(
@@ -182,6 +183,7 @@ fn terminal_ui_renders_completed_pass_chart_and_stability_strip() {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             offset: 0,
             bytes_processed: 1_000_000,
+            elapsed_io: std::time::Duration::ZERO,
             mb_per_second,
         });
     }
@@ -191,6 +193,7 @@ fn terminal_ui_renders_completed_pass_chart_and_stability_strip() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 1_000_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 90.0,
     });
 
@@ -302,6 +305,7 @@ fn terminal_ui_archives_completed_live_pass_when_next_pass_starts() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 1_000_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 100.0,
     });
     ui.observe_sample(StreamingIoSample {
@@ -310,6 +314,7 @@ fn terminal_ui_archives_completed_live_pass_when_next_pass_starts() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 500_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 80.0,
     });
 
@@ -331,6 +336,7 @@ fn terminal_ui_renders_progress_megabytes_with_fractional_precision() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 500_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 125.0,
     });
 
@@ -351,6 +357,7 @@ fn terminal_ui_keeps_progress_gauge_visible_with_live_text() {
         timestamp: std::time::SystemTime::UNIX_EPOCH,
         offset: 0,
         bytes_processed: 2_000_000_000,
+        elapsed_io: std::time::Duration::ZERO,
         mb_per_second: 125.0,
     });
 

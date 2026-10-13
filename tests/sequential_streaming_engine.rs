@@ -119,6 +119,81 @@ fn engine_records_disabled_cache_method_in_report_metadata() {
     );
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn engine_uncached_io_preserves_unaligned_file_sizes_and_counts() {
+    let dir = TestDir::new("studiofs-bench-uncached-tails");
+    for bytes in [1, 513, 8193, 16387] {
+        let path = dir.path().join(format!("stream-{bytes}.bin"));
+        let mut samples = Vec::new();
+        let report = StreamingIoEngine::with_block_size(4097)
+            .unwrap()
+            .run_with_cache_mode(
+                &path,
+                bytes,
+                CacheMode::Disabled,
+                |sample| samples.push(sample),
+                || false,
+            )
+            .unwrap();
+        assert_eq!((report.bytes_written, report.bytes_read), (bytes, bytes));
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes);
+        assert!(!report.stopped);
+        for phase in [StreamingIoPhase::Write, StreamingIoPhase::Read] {
+            let last = samples
+                .iter()
+                .rfind(|sample| sample.phase == phase)
+                .unwrap();
+            assert_eq!(last.bytes_processed, bytes);
+        }
+        let contents = fs::read(&path).unwrap();
+        assert!(contents.len() < 8 || contents[..8] == 0_u64.to_le_bytes());
+        if contents.len() >= 4104 {
+            assert_eq!(contents[4096..4104], 4096_u64.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn engine_uncached_stop_preserves_only_written_bytes() {
+    let dir = TestDir::new("studiofs-bench-uncached-stop");
+    let path = dir.path().join("stream.bin");
+    let mut checks = 0;
+    let report = StreamingIoEngine::with_block_size(4096)
+        .unwrap()
+        .run_with_cache_mode(
+            &path,
+            16387,
+            CacheMode::Disabled,
+            |_| {},
+            || {
+                checks += 1;
+                checks > 1
+            },
+        )
+        .unwrap();
+    assert!(report.stopped);
+    assert_eq!(report.bytes_read, 0);
+    assert_eq!(fs::metadata(&path).unwrap().len(), report.bytes_written);
+    assert!(report.bytes_written > 0 && report.bytes_written < 16387);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn engine_uncached_read_rejects_missing_logical_bytes() {
+    let dir = TestDir::new("studiofs-bench-uncached-short-read");
+    let path = dir.path().join("short.bin");
+    fs::write(&path, [1, 2, 3]).unwrap();
+    let error = StreamingIoEngine::with_block_size(4096)
+        .unwrap()
+        .read_with_cache_mode(&path, 4, CacheMode::Disabled, 1, |_| {}, || false)
+        .unwrap_err();
+    assert!(
+        matches!(error, StreamingIoError::PathIo { source, .. } if source.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+}
+
 #[test]
 fn engine_skips_zero_byte_read_without_opening_file() {
     let dir = TestDir::new("studiofs-bench-sfs-573-zero-read");
@@ -174,7 +249,7 @@ fn engine_stamps_offsets_inside_large_chunks() {
 
 #[cfg(windows)]
 fn expected_disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::WriteThrough
+    CacheControlMethod::NoBuffering
 }
 
 #[cfg(target_os = "macos")]
@@ -184,12 +259,12 @@ fn expected_disabled_cache_method() -> CacheControlMethod {
 
 #[cfg(target_os = "linux")]
 fn expected_disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::PosixFadviseDontNeed
+    CacheControlMethod::DirectIo
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn expected_disabled_cache_method() -> CacheControlMethod {
-    CacheControlMethod::BestEffortUnavailable
+    CacheControlMethod::Unsupported
 }
 
 struct TestDir {
